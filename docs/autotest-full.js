@@ -1,5 +1,5 @@
 /**
- * Sunland – Autotest: Full Farm Automation  (infinite loop edition)
+ * Sunflower Land – Autotest: Full Farm Automation  (infinite loop edition)
  *
  * Paste this script into the browser console while on the farm page.
  * It will continuously harvest crops, flowers, trees and minerals,
@@ -293,7 +293,7 @@
     const url      = URL.createObjectURL(blob);
     const a        = document.createElement("a");
     a.href         = url;
-    a.download     = `sunland-autotest-${new Date().toISOString().slice(0, 10)}.log`;
+    a.download     = `sfl-autotest-${new Date().toISOString().slice(0, 10)}.log`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -512,7 +512,17 @@
   function _getFertMode(seedName) {
     if (!CONFIG.crops.useFertiliser) return "none";
     const override = CONFIG.crops.fertPerCrop[seedName];
-    return override || CONFIG.fertiliserMode || CONFIG.crops.fertiliserMode || "full";
+    return override || CONFIG.crops.fertiliserMode || "full";
+  }
+
+  /**
+   * Finds the in-page seed selector button whose label contains the given seed name
+   * (with the " Seed" suffix stripped so it matches display labels like "Sunflower").
+   */
+  function _findSeedButton(seedName) {
+    const label = seedName.replace(/ Seed$/i, "");
+    return Array.from(document.querySelectorAll("[class*='seed'], [class*='plant']"))
+      .find(function (el) { return el.textContent && el.textContent.includes(label); }) || null;
   }
 
   /**
@@ -639,8 +649,7 @@
           simulateClick(plot);
           await randomDelay();
 
-          const seedBtn = Array.from(document.querySelectorAll("[class*='seed'], [class*='plant']"))
-            .find(el => el.textContent && el.textContent.includes(seed.replace(" Seed", "")));
+          const seedBtn = _findSeedButton(seed);
 
           if (seedBtn) {
             simulateClick(seedBtn);
@@ -873,8 +882,7 @@
           simulateClick(bed);
           await randomDelay();
 
-          const seedBtn = Array.from(document.querySelectorAll("[class*='seed'], [class*='plant']"))
-            .find(el => el.textContent && el.textContent.includes(seed.replace(" Seed", "")));
+          const seedBtn = _findSeedButton(seed);
           if (seedBtn) {
             simulateClick(seedBtn);
             await randomDelay();
@@ -1114,7 +1122,7 @@
 
   async function runAutotest() {
     log("SYSTEM", "info",
-      "🌻 Sunland Full Autotest started.\n" +
+      "🌻 Sunflower Land Full Autotest started.\n" +
       "   Enabled features:\n" +
       `     crops:     ${CONFIG.features.crops}\n` +
       `     flowers:   ${CONFIG.features.flowers}\n` +
