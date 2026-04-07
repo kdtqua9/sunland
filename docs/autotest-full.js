@@ -325,9 +325,11 @@
   /**
    * Send a single message to Telegram immediately, bypassing the batch buffer.
    * Used for time-sensitive messages such as click-coordinate reports.
+   * Respects the `enabled` flag; no-ops silently when Telegram is disabled.
    */
   async function sendTelegramImmediate(text) {
     const tg = CONFIG.logging.telegram;
+    if (!tg.enabled) return;
     if (!tg.botToken || !tg.chatId) return;
     try {
       const resp = await fetch(
@@ -1230,11 +1232,15 @@
     );
 
     // Send a startup ping so the user can confirm Telegram is working.
-    sendTelegramImmediate(
-      "🌻 Sunflower Land Autotest started.\n" +
-      `Features: crops=${CONFIG.features.crops} flowers=${CONFIG.features.flowers}\n` +
-      `Resources: ${Object.entries(CONFIG.features.resources).filter(([,v])=>v).map(([k])=>k).join(", ")}`
-    );
+    if (CONFIG.logging.telegram.enabled) {
+      sendTelegramImmediate(
+        "🌻 Sunflower Land Autotest started.\n" +
+        `Features: crops=${CONFIG.features.crops} flowers=${CONFIG.features.flowers}\n` +
+        `Resources: ${Object.entries(CONFIG.features.resources).filter(([,v])=>v).map(([k])=>k).join(", ")}`
+      );
+    } else {
+      console.log("[SYSTEM] ℹ️  Telegram not configured – fill in botToken + chatId to enable.");
+    }
 
     let round = 0;
 
