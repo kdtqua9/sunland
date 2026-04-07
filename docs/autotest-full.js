@@ -114,7 +114,11 @@
        */
       toFile: false,
       telegram: {
-        /** Send log lines / error summaries to a Telegram bot */
+        /**
+         * Send log lines / error summaries to a Telegram bot.
+         * NOTE: if you fill in botToken + chatId below, this is auto-set to
+         * true at startup – you do NOT need to change `enabled` manually.
+         */
         enabled: false,
         botToken: "",   // "123456:ABC-DEF…"
         chatId: "",     // "-1001234567890" or your personal chat ID
@@ -132,6 +136,17 @@
   // ══════════════════════════════════════════════════════════════════════════
   // End of CONFIG
   // ══════════════════════════════════════════════════════════════════════════
+
+  // Auto-enable Telegram when credentials are provided but the flag was left
+  // as the default `false`.  This way users only need to fill in botToken and
+  // chatId – no separate `enabled: true` step required.
+  (function () {
+    const tg = CONFIG.logging.telegram;
+    if (tg.botToken && tg.chatId && !tg.enabled) {
+      tg.enabled = true;
+      console.log("[SYSTEM] ℹ️  Telegram credentials detected – logging enabled automatically.");
+    }
+  })();
 
   // ─── Capture native timers BEFORE any game code can override them ─────────
   const _nativeSetTimeout  = window.setTimeout.bind(window);
@@ -198,59 +213,45 @@
   }
 
   /**
-   * Walk up the DOM from `startEl`, up to `maxLevels` levels, and return the
-   * first ancestor element that has a React `onClick` handler attached.
+   * Dispatch a full pointer + mouse click sequence at the exact viewport
+   * coordinate (x, y).  Uses document.elementFromPoint so the events always
+   * land on whatever element is actually rendered at that position – no DOM
+   * walking or React-props inspection required.
    *
-   * React 17+ stores synthetic-event props in a `__reactProps$xxxx` key on the
-   * DOM node itself.  This is more reliable than guessing DOM depth because it
-   * finds the real React event handler regardless of how many wrapper divs exist.
+   * Fires: pointerover → pointerenter → mouseover → pointerdown → mousedown
+   *        → pointerup → mouseup → click
    *
-   * Falls back to `null` if no such element is found within `maxLevels`.
+   * Returns the {x, y} pair actually used (useful for logging).
    */
-  function _findReactClickTarget(startEl, maxLevels) {
-    let el = startEl.parentElement;
-    for (let i = 0; i < maxLevels && el; i++) {
-      try {
-        const propsKey = Object.keys(el).find(function (k) {
-          return k.startsWith("__reactProps");
-        });
-        if (propsKey && el[propsKey] && typeof el[propsKey].onClick === "function") {
-          return el;
-        }
-      } catch (_) {}
-      el = el.parentElement;
-    }
-    return null;
+  function simulateClickAt(x, y) {
+    const target = document.elementFromPoint(x, y) || document.body;
+    const base = {
+      bubbles: true, cancelable: true,
+      clientX: x, clientY: y,
+      screenX: x + (window.screenX || 0),
+      screenY: y + (window.screenY || 0),
+      view: window,
+    };
+    const ptrBase = Object.assign(
+      { pointerId: 1, isPrimary: true, pointerType: "mouse", pressure: 0.5 },
+      base
+    );
+    target.dispatchEvent(new PointerEvent("pointerover",  ptrBase));
+    target.dispatchEvent(new PointerEvent("pointerenter", Object.assign({}, ptrBase, { bubbles: false })));
+    target.dispatchEvent(new MouseEvent("mouseover",  base));
+    target.dispatchEvent(new PointerEvent("pointerdown", ptrBase));
+    target.dispatchEvent(new MouseEvent("mousedown",  base));
+    target.dispatchEvent(new PointerEvent("pointerup",   ptrBase));
+    target.dispatchEvent(new MouseEvent("mouseup",    base));
+    target.dispatchEvent(new MouseEvent("click",      base));
+    return { x, y };
   }
 
-  /**
-   * Proven fallback: walk `depth` levels above `img` and validate that the
-   * resulting element is a DIV with class "absolute" – the same check used in
-   * the working `autotest-click-tree.js` script.
-   */
-  function _walkUpAbsoluteDiv(img, depth) {
-    let el = img.parentElement;
-    for (let i = 1; i < depth; i++) {
-      el = el && el.parentElement;
-    }
-    if (el && el.tagName === "DIV" && el.classList.contains("absolute")) {
-      return el;
-    }
-    // Also try one level higher in case depth is off by one
-    const higher = el && el.parentElement;
-    if (higher && higher.tagName === "DIV" && higher.classList.contains("absolute")) {
-      return higher;
-    }
-    return null;
-  }
-
+  /** Convenience wrapper: click the centre (± jitter) of a DOM element. */
   function simulateClick(element) {
     const rect = element.getBoundingClientRect();
     const { x, y } = jitterCoord(rect);
-    const opts = { bubbles: true, cancelable: true, clientX: x, clientY: y };
-    element.dispatchEvent(new MouseEvent("mousedown", opts));
-    element.dispatchEvent(new MouseEvent("mouseup",   opts));
-    element.dispatchEvent(new MouseEvent("click",     opts));
+    return simulateClickAt(x, y);
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -303,7 +304,7 @@
 
     const text = _tgBuffer.splice(0, _tgBuffer.length).join("\n");
     try {
-      await fetch(
+      const resp = await fetch(
         `https://api.telegram.org/bot${botToken}/sendMessage`,
         {
           method: "POST",
@@ -311,9 +312,38 @@
           body: JSON.stringify({ chat_id: chatId, text: text, parse_mode: "HTML" }),
         }
       );
+      if (!resp.ok) {
+        const body = await resp.text().catch(function () { return "(unreadable)"; });
+        console.error("[SYSTEM] ❌ Telegram API error:", resp.status, body);
+      }
     } catch (err) {
       // Only log to console to avoid infinite recursion
       console.error("[SYSTEM] ❌ Telegram flush failed:", err);
+    }
+  }
+
+  /**
+   * Send a single message to Telegram immediately, bypassing the batch buffer.
+   * Used for time-sensitive messages such as click-coordinate reports.
+   */
+  async function sendTelegramImmediate(text) {
+    const tg = CONFIG.logging.telegram;
+    if (!tg.botToken || !tg.chatId) return;
+    try {
+      const resp = await fetch(
+        `https://api.telegram.org/bot${tg.botToken}/sendMessage`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: tg.chatId, text: text }),
+        }
+      );
+      if (!resp.ok) {
+        const body = await resp.text().catch(function () { return "(unreadable)"; });
+        console.error("[SYSTEM] ❌ Telegram sendMessage error:", resp.status, body);
+      }
+    } catch (err) {
+      console.error("[SYSTEM] ❌ Telegram sendMessage failed:", err);
     }
   }
 
@@ -1027,21 +1057,15 @@
   };
 
   /**
-   * Returns the list of clickable elements for non-depleted resources of `type`.
-   *
-   * Strategy:
-   *  1. Primary  – use React's `__reactProps` key to walk up from the image and
-   *               find the first ancestor that has an `onClick` handler.  This
-   *               is immune to DOM-depth changes and works for all resource types.
-   *  2. Fallback – walk `domWalkUp` levels and validate `classList.contains
-   *               ("absolute")`, the same check used in the proven
-   *               `autotest-click-tree.js` script.
+   * Returns the list of <img> elements for non-depleted, visible resources of
+   * `type`.  Clicking is done via document.elementFromPoint so we only need
+   * the image's bounding rect – no DOM walking needed any more.
    */
   function findAvailableResources(type) {
     const def = RESOURCE_DEFS[type];
     if (!def) return [];
 
-    const imgs = Array.from(
+    return Array.from(
       document.querySelectorAll(`img[src*='${def.imgPattern}']`)
     ).filter(function (img) {
       try {
@@ -1050,60 +1074,65 @@
         if (def.extraExclude    && src.includes(def.extraExclude))    return false;
         if (def.extraExclude2   && src.includes(def.extraExclude2))   return false;
         if (def.imgRegex        && !def.imgRegex.test(new URL(src).pathname)) return false;
+        // Must have a non-zero bounding box (i.e. be visible in the viewport)
+        const rect = img.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return false;
         return true;
       } catch (_) { return false; }
     });
-
-    const clickTargets = imgs.map(function (img) {
-      // Strategy 1: React props – find the ancestor with a real onClick handler.
-      const reactTarget = _findReactClickTarget(img, 10);
-      if (reactTarget) return reactTarget;
-
-      // Strategy 2: fixed-depth walk + "absolute" class (proven tree-script pattern).
-      return _walkUpAbsoluteDiv(img, def.domWalkUp);
-    }).filter(Boolean);
-
-    return Array.from(new Set(clickTargets));
   }
 
   /**
    * Depletes all available resources of `type` with random delays.
-   * Returns the count of resources hit.
+   * For each resource the img's bounding rect is used to compute fresh
+   * jittered (x, y) coordinates for every individual hit, so all clicks land
+   * on the visible sprite even if the DOM shifts between hits.
+   * Click coordinates are reported to Telegram immediately after each depletion.
+   * Returns the count of resources fully depleted.
    */
   async function harvestResource(type, round) {
-    const def       = RESOURCE_DEFS[type];
-    const resources = findAvailableResources(type);
-    if (resources.length === 0) return 0;
+    const def  = RESOURCE_DEFS[type];
+    const imgs = findAvailableResources(type);
+    if (imgs.length === 0) return 0;
 
-    log("RESOURCES", "info", `[${type}] Found ${resources.length} available.`);
+    log("RESOURCES", "info", `[${type}] Found ${imgs.length} available.`);
 
     let count = 0;
-    for (let i = 0; i < resources.length; i++) {
+    for (let i = 0; i < imgs.length; i++) {
       if (stopped) break;
       if (isCaptchaVisible()) {
         log("RESOURCES", "warn", `[${type}] Captcha detected – pausing.`);
         break;
       }
 
-      const target = resources[i];
-      log("RESOURCES", "info", `[${type}] ${i + 1}/${resources.length} – depleting…`);
+      const img = imgs[i];
+      log("RESOURCES", "info", `[${type}] ${i + 1}/${imgs.length} – depleting…`);
 
       try {
+        const hitCoords = [];
         for (let hit = 0; hit < def.hits; hit++) {
           if (stopped) break;
-          simulateClick(target);
+          // Re-read the bounding rect each hit so coords remain valid even if
+          // the element has been repositioned by a CSS animation.
+          const rect = img.getBoundingClientRect();
+          const { x, y } = jitterCoord(rect);
+          simulateClickAt(x, y);
+          hitCoords.push(`(${Math.round(x)},${Math.round(y)})`);
           if (hit < def.hits - 1) await sleep(randInt(200, 500));
         }
         count++;
-        log("RESOURCES", "ok", `[${type}] Depleted #${i + 1}.`);
+        const coordStr = hitCoords.join(" → ");
+        log("RESOURCES", "ok", `[${type}] Depleted #${i + 1} – clicks: ${coordStr}`);
+        // Send click coordinates to Telegram immediately (not batched).
+        sendTelegramImmediate(`✅ [${type}] #${i + 1}/${imgs.length} depleted\nClicks: ${coordStr}`);
       } catch (err) {
         recordError("RESOURCES", `[${type}] Hit failed: ${err.message || err}`);
       }
 
-      if (i < resources.length - 1) await randomDelay();
+      if (i < imgs.length - 1) await randomDelay();
     }
 
-    log("RESOURCES", "info", `[${type}] Done – depleted ${count}/${resources.length}.`);
+    log("RESOURCES", "info", `[${type}] Done – depleted ${count}/${imgs.length}.`);
     return count;
   }
 
@@ -1198,6 +1227,13 @@
       `     flowers:   ${CONFIG.features.flowers}\n` +
       `     resources: ${JSON.stringify(CONFIG.features.resources)}\n` +
       "   Run  stopAutotest()  to stop at any time."
+    );
+
+    // Send a startup ping so the user can confirm Telegram is working.
+    sendTelegramImmediate(
+      "🌻 Sunflower Land Autotest started.\n" +
+      `Features: crops=${CONFIG.features.crops} flowers=${CONFIG.features.flowers}\n` +
+      `Resources: ${Object.entries(CONFIG.features.resources).filter(([,v])=>v).map(([k])=>k).join(", ")}`
     );
 
     let round = 0;
