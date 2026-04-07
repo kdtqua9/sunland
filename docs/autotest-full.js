@@ -197,7 +197,53 @@
     return { x, y };
   }
 
-  /** Dispatches a realistic mousedown → mouseup → click sequence. */
+  /**
+   * Walk up the DOM from `startEl`, up to `maxLevels` levels, and return the
+   * first ancestor element that has a React `onClick` handler attached.
+   *
+   * React 17+ stores synthetic-event props in a `__reactProps$xxxx` key on the
+   * DOM node itself.  This is more reliable than guessing DOM depth because it
+   * finds the real React event handler regardless of how many wrapper divs exist.
+   *
+   * Falls back to `null` if no such element is found within `maxLevels`.
+   */
+  function _findReactClickTarget(startEl, maxLevels) {
+    let el = startEl.parentElement;
+    for (let i = 0; i < maxLevels && el; i++) {
+      try {
+        const propsKey = Object.keys(el).find(function (k) {
+          return k.startsWith("__reactProps");
+        });
+        if (propsKey && el[propsKey] && typeof el[propsKey].onClick === "function") {
+          return el;
+        }
+      } catch (_) {}
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  /**
+   * Proven fallback: walk `depth` levels above `img` and validate that the
+   * resulting element is a DIV with class "absolute" – the same check used in
+   * the working `autotest-click-tree.js` script.
+   */
+  function _walkUpAbsoluteDiv(img, depth) {
+    let el = img.parentElement;
+    for (let i = 1; i < depth; i++) {
+      el = el && el.parentElement;
+    }
+    if (el && el.tagName === "DIV" && el.classList.contains("absolute")) {
+      return el;
+    }
+    // Also try one level higher in case depth is off by one
+    const higher = el && el.parentElement;
+    if (higher && higher.tagName === "DIV" && higher.classList.contains("absolute")) {
+      return higher;
+    }
+    return null;
+  }
+
   function simulateClick(element) {
     const rect = element.getBoundingClientRect();
     const { x, y } = jitterCoord(rect);
@@ -925,6 +971,10 @@
     stone: {
       imgPattern:     "/resources/stone",
       excludePattern: "depleted",
+      // Exclude strike / drop animation sprite sheets – these match
+      // imgPattern but their DOM depth differs, causing wrong click targets.
+      extraExclude:   "_spark",
+      extraExclude2:  "_drop",
       hits:           3,
       recoveryMs:     4 * 60 * 60 * 1000,  // 4 hours
       domWalkUp:      3,
@@ -932,6 +982,8 @@
     iron: {
       imgPattern:     "/resources/iron",
       excludePattern: "depleted",
+      extraExclude:   "_spark",
+      extraExclude2:  "_drop",
       hits:           3,
       recoveryMs:     8 * 60 * 60 * 1000,  // 8 hours
       domWalkUp:      3,
@@ -939,6 +991,8 @@
     gold: {
       imgPattern:     "/resources/gold",
       excludePattern: "depleted",
+      extraExclude:   "_spark",
+      extraExclude2:  "_drop",
       hits:           3,
       recoveryMs:     8 * 60 * 60 * 1000,
       domWalkUp:      3,
@@ -946,6 +1000,8 @@
     crimstone: {
       imgPattern:     "/resources/crimstone",
       excludePattern: "depleted",
+      extraExclude:   "_spark",
+      extraExclude2:  "_drop",
       hits:           5,
       recoveryMs:     24 * 60 * 60 * 1000, // 24 hours
       domWalkUp:      3,
@@ -953,6 +1009,8 @@
     sunstone: {
       imgPattern:     "/resources/sunstone",
       excludePattern: "depleted",
+      extraExclude:   "_spark",
+      extraExclude2:  "_drop",
       hits:           5,
       recoveryMs:     24 * 60 * 60 * 1000,
       domWalkUp:      3,
@@ -960,6 +1018,8 @@
     obsidian: {
       imgPattern:     "/resources/obsidian",
       excludePattern: "depleted",
+      extraExclude:   "_spark",
+      extraExclude2:  "_drop",
       hits:           5,
       recoveryMs:     24 * 60 * 60 * 1000,
       domWalkUp:      3,
@@ -968,6 +1028,14 @@
 
   /**
    * Returns the list of clickable elements for non-depleted resources of `type`.
+   *
+   * Strategy:
+   *  1. Primary  – use React's `__reactProps` key to walk up from the image and
+   *               find the first ancestor that has an `onClick` handler.  This
+   *               is immune to DOM-depth changes and works for all resource types.
+   *  2. Fallback – walk `domWalkUp` levels and validate `classList.contains
+   *               ("absolute")`, the same check used in the proven
+   *               `autotest-click-tree.js` script.
    */
   function findAvailableResources(type) {
     const def = RESOURCE_DEFS[type];
@@ -978,19 +1046,21 @@
     ).filter(function (img) {
       try {
         const src = img.src || "";
-        if (def.excludePattern && src.includes(def.excludePattern)) return false;
-        if (def.extraExclude   && src.includes(def.extraExclude))   return false;
-        if (def.imgRegex       && !def.imgRegex.test(new URL(src).pathname)) return false;
+        if (def.excludePattern  && src.includes(def.excludePattern))  return false;
+        if (def.extraExclude    && src.includes(def.extraExclude))    return false;
+        if (def.extraExclude2   && src.includes(def.extraExclude2))   return false;
+        if (def.imgRegex        && !def.imgRegex.test(new URL(src).pathname)) return false;
         return true;
       } catch (_) { return false; }
     });
 
     const clickTargets = imgs.map(function (img) {
-      let el = img;
-      for (let i = 0; i < def.domWalkUp; i++) {
-        el = el && el.parentElement;
-      }
-      return el && el.tagName === "DIV" ? el : null;
+      // Strategy 1: React props – find the ancestor with a real onClick handler.
+      const reactTarget = _findReactClickTarget(img, 10);
+      if (reactTarget) return reactTarget;
+
+      // Strategy 2: fixed-depth walk + "absolute" class (proven tree-script pattern).
+      return _walkUpAbsoluteDiv(img, def.domWalkUp);
     }).filter(Boolean);
 
     return Array.from(new Set(clickTargets));
