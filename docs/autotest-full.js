@@ -104,6 +104,38 @@
       notifyIfCantPlant: true,
     },
 
+    // ── Resource settings ────────────────────────────────────────────────────
+    resources: {
+      /**
+       * Delay between consecutive hits on the same resource node.
+       * Moved here from harvestResource() so you can tune without touching code.
+       */
+      hitDelayMs: { min: 600, max: 1200 },
+
+      /**
+       * Tool requirements per resource type.
+       * Before harvesting, the script checks inventory for the required tool.
+       * If missing it opens the configured shop and buys a random quantity
+       * between buyMin and buyMax.
+       * If the purchase fails (not enough coins / shop not found) a Telegram
+       * alert is sent and that resource type is skipped for this round.
+       *
+       * Set  enabled: false  to skip the tool check for a specific type
+       * (useful if you already have a stockpile and don't need auto-buy).
+       *
+       * shop values: "Market" for basic tools, "Blacksmith" for advanced ones.
+       */
+      tools: {
+        trees:     { tool: "Axe",               shop: "Market",      buyMin: 3, buyMax: 5, enabled: true },
+        stone:     { tool: "Pickaxe",           shop: "Market",      buyMin: 3, buyMax: 5, enabled: true },
+        iron:      { tool: "Stone Pickaxe",     shop: "Blacksmith",  buyMin: 2, buyMax: 3, enabled: true },
+        gold:      { tool: "Iron Pickaxe",      shop: "Blacksmith",  buyMin: 2, buyMax: 3, enabled: true },
+        crimstone: { tool: "Gold Pickaxe",      shop: "Blacksmith",  buyMin: 1, buyMax: 2, enabled: true },
+        sunstone:  { tool: "Crimstone Pickaxe", shop: "Blacksmith",  buyMin: 1, buyMax: 2, enabled: true },
+        obsidian:  { tool: "Obsidian Pickaxe",  shop: "Blacksmith",  buyMin: 1, buyMax: 2, enabled: true },
+      },
+    },
+
     // ── Logging settings ─────────────────────────────────────────────────────
     logging: {
       /** Print structured lines to the browser console */
@@ -122,16 +154,22 @@
         enabled: false,
         botToken: "",   // "123456:ABC-DEF…"
         chatId: "",     // "-1001234567890" or your personal chat ID
-        /** Flush buffered messages every N seconds (0 = immediate) */
+        /** Flush buffered log messages every N seconds (0 = immediate). */
         flushIntervalSec: 30,
         /**
-         * When true, the script polls the Telegram bot for incoming messages
-         * every ~30 s and stops immediately if a "stop" or "/stop" message
-         * is received from the configured chatId.
-         * Only messages from the exact chatId are accepted – other chats
-         * are silently ignored.
+         * When true, the script polls Telegram for incoming commands every
+         * commandPollIntervalSec seconds.  Accepted commands (from chatId only):
+         *   "stop"  / "/stop"  → pause the autotest; sends a confirmation.
+         *   "start" / "/start" → resume after a pause; sends a confirmation.
+         * A hard stop is still available via stopAutotest() in the console.
          */
-        listenForStop: true,
+        listenForCommands: true,
+        /**
+         * How often (seconds) the script polls Telegram for stop/start
+         * commands.  Also controls how frequently the inter-round countdown
+         * log line is printed.  Default: 30 s.
+         */
+        commandPollIntervalSec: 30,
       },
       /**
        * IANA timezone for log timestamps.
@@ -167,8 +205,9 @@
   const _nativeSetTimeout  = window.setTimeout.bind(window);
   const _nativeClearTimeout = window.clearTimeout.bind(window);
 
-  // ─── Stop control ─────────────────────────────────────────────────────────
-  let stopped = false;
+  // ─── Stop / pause control ─────────────────────────────────────────────────
+  let stopped = false;  // hard stop (console stopAutotest())
+  let paused  = false;  // soft pause via Telegram "stop" command; "start" resumes
 
   // ─── Web Worker for background-safe sleep ─────────────────────────────────
   const _workerCode = `
@@ -384,15 +423,16 @@
   }
 
   /**
-   * Poll Telegram getUpdates for incoming messages.
-   * If a "stop" or "/stop" message arrives from the configured chatId,
-   * the autotest is halted and a confirmation is sent back to Telegram.
-   * Messages from other chats are silently ignored.
-   * No-op when Telegram is disabled or listenForStop is false.
+   * Poll Telegram getUpdates for incoming command messages.
+   * Accepted commands (only from the configured chatId):
+   *   "stop"  / "/stop"  → pause the autotest (sets paused=true) and confirms.
+   *   "start" / "/start" → resume after a pause (clears paused) and confirms.
+   * A hard stop is only available via stopAutotest() in the console.
+   * No-op when Telegram is disabled or listenForCommands is false.
    */
-  async function _pollTelegramStop() {
+  async function _pollTelegramCommands() {
     const tg = CONFIG.logging.telegram;
-    if (!tg.enabled || !tg.listenForStop || !tg.botToken || !tg.chatId) return;
+    if (!tg.enabled || !tg.listenForCommands || !tg.botToken || !tg.chatId) return;
     try {
       const url =
         `https://api.telegram.org/bot${tg.botToken}/getUpdates` +
@@ -415,11 +455,18 @@
         if (fromId !== String(tg.chatId)) continue;
 
         const text = (msg.text || "").trim().toLowerCase();
-        if (text === "stop" || text === "/stop") {
-          log("SYSTEM", "info", "🛑 Received 'stop' command from Telegram – stopping autotest.");
-          await sendTelegramImmediate("🛑 Stop command received. Autotest is shutting down…");
-          await window.stopAutotest();
-          return;
+
+        if ((text === "stop" || text === "/stop") && !paused) {
+          paused = true;
+          log("SYSTEM", "info", "⏸️ Received 'stop' from Telegram – autotest paused.");
+          await sendTelegramImmediate(
+            "⏸️ Autotest paused.\n" +
+            "Send 'start' or '/start' to resume, or run stopAutotest() in the console for a full stop."
+          );
+        } else if ((text === "start" || text === "/start") && paused) {
+          paused = false;
+          log("SYSTEM", "info", "▶️ Received 'start' from Telegram – autotest resuming.");
+          await sendTelegramImmediate("▶️ Autotest resumed!");
         }
       }
     } catch (_) {
@@ -1193,6 +1240,96 @@
     return new Promise(function (r) { setTimeout(r, ms); });
   }
 
+  // ── Tool buying helpers ───────────────────────────────────────────────────
+
+  /**
+   * Attempt to open `shopType` ("Market" or "Blacksmith"), locate `toolName`
+   * in its inventory, set quantity to `qty`, and confirm the purchase.
+   * Returns true on success, false on any failure.
+   */
+  async function _buyTool(toolName, shopType, qty) {
+    log("RESOURCES", "info", `Buying ${qty}× ${toolName} from ${shopType}…`);
+
+    // Try to open the correct shop panel.
+    const shopSelector = shopType === "Blacksmith"
+      ? "[aria-label*='Blacksmith'], [class*='blacksmith'], [data-tab*='blacksmith']"
+      : "[aria-label*='Shop'], [aria-label*='Market'], [class*='shop'], [class*='market']";
+    const shopBtn = document.querySelector(shopSelector);
+    if (!shopBtn) {
+      log("RESOURCES", "warn", `Cannot find ${shopType} button in the HUD.`);
+      return false;
+    }
+    simulateClick(shopBtn);
+    await randomDelay();
+
+    // Find the tool item inside the shop panel.
+    const toolItem = Array.from(document.querySelectorAll("button, [role='button'], [class*='item']"))
+      .find(function (el) {
+        const t = (el.textContent || "").trim();
+        return t === toolName || t.includes(toolName);
+      });
+    if (!toolItem) {
+      log("RESOURCES", "warn", `${toolName} not found in ${shopType} panel.`);
+      return false;
+    }
+    simulateClick(toolItem);
+    await randomDelay();
+
+    // Increase quantity using the "+" button if we need more than 1.
+    if (qty > 1) {
+      const plusBtn = document.querySelector(
+        "[aria-label*='increase'], [aria-label*='plus'], button[class*='plus'], button[class*='increment']"
+      );
+      if (plusBtn) {
+        for (let i = 1; i < qty; i++) {
+          simulateClick(plusBtn);
+          await _sleepMs(150);
+        }
+      }
+    }
+
+    // Confirm the purchase.
+    const confirmBtn = document.querySelector(
+      "button[class*='confirm'], button[class*='buy'], [aria-label*='Buy'], [aria-label*='Confirm']"
+    );
+    if (!confirmBtn) {
+      log("RESOURCES", "warn", `Could not find confirm button when buying ${toolName}.`);
+      return false;
+    }
+    simulateClick(confirmBtn);
+    await randomDelay();
+    log("RESOURCES", "ok", `Bought ${qty}× ${toolName} from ${shopType}.`);
+    return true;
+  }
+
+  /**
+   * Check that at least one of the required tool for `type` is in inventory.
+   * If not, attempt to buy a random quantity (buyMin–buyMax from CONFIG).
+   * Sends a Telegram alert and returns false when the purchase fails (e.g.
+   * insufficient coins).  Returns true when the tool is available or when
+   * the tool check is disabled for this type.
+   */
+  async function _ensureTool(type) {
+    const toolCfg = CONFIG.resources.tools[type];
+    if (!toolCfg || !toolCfg.enabled) return true;
+
+    const inv  = getInventory();
+    const have = inv[toolCfg.tool] || 0;
+    if (have >= 1) return true;
+
+    const qty    = randInt(toolCfg.buyMin, toolCfg.buyMax);
+    const bought = await _buyTool(toolCfg.tool, toolCfg.shop, qty);
+    if (!bought) {
+      const msg =
+        `❌ [${type}] Cannot harvest: no ${toolCfg.tool} in inventory ` +
+        `and purchase from ${toolCfg.shop} failed (not enough coins?).`;
+      log("RESOURCES", "warn", msg);
+      await sendTelegramImmediate(msg);
+      return false;
+    }
+    return true;
+  }
+
   /**
    * Depletes all available resources of `type` with random delays.
    * Detection uses img src patterns (reliable count).
@@ -1208,6 +1345,13 @@
     const def  = RESOURCE_DEFS[type];
     const imgs = findAvailableResources(type);
     if (imgs.length === 0) return 0;
+
+    // Ensure the required tool is available before touching any node.
+    const hasTools = await _ensureTool(type);
+    if (!hasTools) {
+      log("RESOURCES", "info", `[${type}] Skipping – no tool available.`);
+      return 0;
+    }
 
     log("RESOURCES", "info", `[${type}] Found ${imgs.length} available.`);
 
@@ -1232,8 +1376,8 @@
           if (stopped) break;
 
           // Sleep BEFORE every hit using plain setTimeout (CSP-safe).
-          // 600–1200 ms matches the mini-snippet timing that is confirmed working.
-          const preDelay = randInt(600, 1200);
+          // Interval is drawn from CONFIG.resources.hitDelayMs.
+          const preDelay = randInt(CONFIG.resources.hitDelayMs.min, CONFIG.resources.hitDelayMs.max);
           await _sleepMs(preDelay);
 
           // Use the clickTarget's bounding rect for the centre coordinate.
@@ -1373,7 +1517,10 @@
       sendTelegramImmediate(
         "🌻 Sunflower Land Autotest started.\n" +
         `Features: crops=${CONFIG.features.crops} flowers=${CONFIG.features.flowers}\n` +
-        `Resources: ${Object.entries(CONFIG.features.resources).filter(([,v])=>v).map(([k])=>k).join(", ")}`
+        `Resources: ${Object.entries(CONFIG.features.resources).filter(([,v])=>v).map(([k])=>k).join(", ")}\n` +
+        (CONFIG.logging.telegram.listenForCommands
+          ? "Commands: send 'stop' to pause · 'start' to resume"
+          : "")
       );
     } else {
       console.log("[SYSTEM] ℹ️  Telegram not configured – fill in botToken + chatId to enable.");
@@ -1387,14 +1534,21 @@
       // ── Pre-check summary ────────────────────────────────────────────────
       logYieldSummary();
 
-      // ── Check for Telegram stop command before starting modules ─────────
-      await _pollTelegramStop();
+      // ── Check for Telegram commands before starting modules ─────────────
+      await _pollTelegramCommands();
+      if (stopped) break;
+
+      // If paused by Telegram "stop", wait here until "start" is received.
+      while (paused && !stopped) {
+        await _sleepMs(CONFIG.logging.telegram.commandPollIntervalSec * 1000);
+        await _pollTelegramCommands();
+      }
       if (stopped) break;
 
       // ── Run enabled modules ──────────────────────────────────────────────
-      if (!stopped && CONFIG.features.crops)     await runCropsRound();
-      if (!stopped && CONFIG.features.flowers)   await runFlowersRound();
-      if (!stopped)                               await runResourcesRound(round);
+      if (!stopped && !paused && CONFIG.features.crops)     await runCropsRound();
+      if (!stopped && !paused && CONFIG.features.flowers)   await runFlowersRound();
+      if (!stopped && !paused)                               await runResourcesRound(round);
 
       // ── Error budget check ───────────────────────────────────────────────
       _checkErrorBudget();
@@ -1406,14 +1560,14 @@
       log("SYSTEM", "info", `Round ${round} complete.  Next check in ~${waitMin} min…`);
 
       let elapsed = 0;
-      const POLL  = 30_000; // log remaining time every 30 s
-      while (elapsed < waitMs && !stopped) {
+      const POLL  = CONFIG.logging.telegram.commandPollIntervalSec * 1000;
+      while (elapsed < waitMs && !stopped && !paused) {
         const chunk = Math.min(POLL, waitMs - elapsed);
         await sleep(chunk);
         elapsed += chunk;
-        // Poll for Telegram "stop" command during the inter-round wait.
-        await _pollTelegramStop();
-        if (!stopped && elapsed < waitMs) {
+        // Poll for Telegram commands during the inter-round wait.
+        await _pollTelegramCommands();
+        if (!stopped && !paused && elapsed < waitMs) {
           const remaining = ((waitMs - elapsed) / 60_000).toFixed(1);
           log("SYSTEM", "info", `⏳ ~${remaining} min until next round.`);
         }
