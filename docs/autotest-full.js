@@ -247,11 +247,22 @@
     return { x, y };
   }
 
-  /** Convenience wrapper: click the centre (± jitter) of a DOM element. */
+  /** Convenience wrapper: click the centre (± jitter) of a DOM element.
+   *  Events are dispatched DIRECTLY to `element` so they are guaranteed to
+   *  reach the correct React handler – no elementFromPoint detour that can
+   *  silently resolve to a wrong / overlapping element.
+   */
   function simulateClick(element) {
     const rect = element.getBoundingClientRect();
     const { x, y } = jitterCoord(rect);
-    return simulateClickAt(x, y);
+    element.dispatchEvent(new MouseEvent("click", {
+      bubbles: true, cancelable: true,
+      view: window,
+      clientX: x, clientY: y,
+      screenX: x + (window.screenX || 0),
+      screenY: y + (window.screenY || 0),
+    }));
+    return { x, y };
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -1059,26 +1070,59 @@
   };
 
   /**
-   * Returns the list of <img> elements for non-depleted, visible resources of
-   * `type`.  Clicking is done via document.elementFromPoint so we only need
-   * the image's bounding rect – no DOM walking needed any more.
+   * Returns the list of ready-to-harvest, visible resource elements of `type`.
+   *
+   * Selector rationale:
+   *   ".hover\\:img-highlight.cursor-pointer" — Tailwind utilities the game adds
+   *   ONLY to a resource wrapper when the node is ready (RecoveredTree,
+   *   RecoveredStone, …).  When depleted the component unmounts / removes these
+   *   classes, so the element naturally disappears from results.
+   *
+   * We additionally require:
+   *   1. A non-zero viewport bounding box (element is actually on screen).
+   *   2. An ancestor with style.top containing "calc(50%)" — the MapPlacement
+   *      wrapper the game uses to position every resource on the grid.  This
+   *      excludes unrelated UI elements (shop buttons, collectibles, etc.) that
+   *      share the same class combo.
+   *   3. An <img> descendant whose src matches this type's imgPattern (and does
+   *      NOT match any exclude patterns), so per-type feature flags still work.
    */
   function findAvailableResources(type) {
     const def = RESOURCE_DEFS[type];
     if (!def) return [];
 
     return Array.from(
-      document.querySelectorAll(`img[src*='${def.imgPattern}']`)
-    ).filter(function (img) {
+      document.querySelectorAll(".hover\\:img-highlight.cursor-pointer")
+    ).filter(function (el) {
       try {
+        // ── 1. Visible in viewport ─────────────────────────────────────────
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        if (r.bottom < 0 || r.top  > window.innerHeight) return false;
+        if (r.right  < 0 || r.left > window.innerWidth)  return false;
+
+        // ── 2. Inside a MapPlacement grid cell ─────────────────────────────
+        let node = el.parentElement;
+        let inPlacement = false;
+        while (node && node !== document.body) {
+          if (node.style && node.style.top && node.style.top.includes("calc(50%)")) {
+            inPlacement = true;
+            break;
+          }
+          node = node.parentElement;
+        }
+        if (!inPlacement) return false;
+
+        // ── 3. Matches this resource type ──────────────────────────────────
+        const img = el.querySelector("img");
+        if (!img) return false;
         const src = img.src || "";
-        if (def.excludePattern  && src.includes(def.excludePattern))  return false;
-        if (def.extraExclude    && src.includes(def.extraExclude))    return false;
-        if (def.extraExclude2   && src.includes(def.extraExclude2))   return false;
-        if (def.imgRegex        && !def.imgRegex.test(new URL(src).pathname)) return false;
-        // Must have a non-zero bounding box (i.e. be visible in the viewport)
-        const rect = img.getBoundingClientRect();
-        if (rect.width === 0 || rect.height === 0) return false;
+        if (!src.includes(def.imgPattern))                              return false;
+        if (def.excludePattern  && src.includes(def.excludePattern))   return false;
+        if (def.extraExclude    && src.includes(def.extraExclude))     return false;
+        if (def.extraExclude2   && src.includes(def.extraExclude2))    return false;
+        if (def.imgRegex && !def.imgRegex.test(new URL(src).pathname)) return false;
+
         return true;
       } catch (_) { return false; }
     });
@@ -1086,39 +1130,38 @@
 
   /**
    * Depletes all available resources of `type` with random delays.
-   * For each resource the img's bounding rect is used to compute fresh
-   * jittered (x, y) coordinates for every individual hit, so all clicks land
-   * on the visible sprite even if the DOM shifts between hits.
+   * For each resource the clickable wrapper element is found via
+   * findAvailableResources, then `simulateClick` dispatches the MouseEvent
+   * directly on that element so React's synthetic handler always fires.
+   * Jitter coords are re-computed fresh before every hit.
    * Click coordinates are reported to Telegram immediately after each depletion.
    * Returns the count of resources fully depleted.
    */
   async function harvestResource(type, round) {
-    const def  = RESOURCE_DEFS[type];
-    const imgs = findAvailableResources(type);
-    if (imgs.length === 0) return 0;
+    const def      = RESOURCE_DEFS[type];
+    const elements = findAvailableResources(type);
+    if (elements.length === 0) return 0;
 
-    log("RESOURCES", "info", `[${type}] Found ${imgs.length} available.`);
+    log("RESOURCES", "info", `[${type}] Found ${elements.length} available.`);
 
     let count = 0;
-    for (let i = 0; i < imgs.length; i++) {
+    for (let i = 0; i < elements.length; i++) {
       if (stopped) break;
       if (isCaptchaVisible()) {
         log("RESOURCES", "warn", `[${type}] Captcha detected – pausing.`);
         break;
       }
 
-      const img = imgs[i];
-      log("RESOURCES", "info", `[${type}] ${i + 1}/${imgs.length} – depleting…`);
+      const el = elements[i];
+      log("RESOURCES", "info", `[${type}] ${i + 1}/${elements.length} – depleting…`);
 
       try {
         const hitCoords = [];
         for (let hit = 0; hit < def.hits; hit++) {
           if (stopped) break;
-          // Re-read the bounding rect each hit so coords remain valid even if
-          // the element has been repositioned by a CSS animation.
-          const rect = img.getBoundingClientRect();
-          const { x, y } = jitterCoord(rect);
-          simulateClickAt(x, y);
+          // simulateClick reads the rect fresh each call so coords stay valid
+          // even if a CSS animation repositions the element between hits.
+          const { x, y } = simulateClick(el);
           hitCoords.push(`(${Math.round(x)},${Math.round(y)})`);
           if (hit < def.hits - 1) await sleep(randInt(200, 500));
         }
@@ -1126,15 +1169,15 @@
         const coordStr = hitCoords.join(" → ");
         log("RESOURCES", "ok", `[${type}] Depleted #${i + 1} – clicks: ${coordStr}`);
         // Send click coordinates to Telegram immediately (not batched).
-        sendTelegramImmediate(`✅ [${type}] #${i + 1}/${imgs.length} depleted\nClicks: ${coordStr}`);
+        sendTelegramImmediate(`✅ [${type}] #${i + 1}/${elements.length} depleted\nClicks: ${coordStr}`);
       } catch (err) {
         recordError("RESOURCES", `[${type}] Hit failed: ${err.message || err}`);
       }
 
-      if (i < imgs.length - 1) await randomDelay();
+      if (i < elements.length - 1) await randomDelay();
     }
 
-    log("RESOURCES", "info", `[${type}] Done – depleted ${count}/${imgs.length}.`);
+    log("RESOURCES", "info", `[${type}] Done – depleted ${count}/${elements.length}.`);
     return count;
   }
 
