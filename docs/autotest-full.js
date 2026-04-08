@@ -29,9 +29,12 @@
   const CONFIG = {
     /** Turn entire feature families on / off */
     features: {
-      crops: true,
-      flowers: true,
-      fruits: true,
+      crops:     true,
+      flowers:   true,
+      fruits:    true,
+      pet:       true,    // wake sleeping pet each round
+      honey:     true,    // collect full beehives each round
+      animals:   true,    // use toys on animals that want to play
       resources: {
         trees: true,
         stone: true,
@@ -124,6 +127,52 @@
       fertiliserMode: "full",
       /** Try to buy fruit seeds / saplings from the shop when the slot is empty */
       buyMissingSeeds: false,
+    },
+
+    // ── Pet settings ────────────────────────────────────────────────────────
+    pet: {
+      /**
+       * IMG src substrings that indicate the pet is sleeping.
+       * Checked case-insensitively.  Extend if the game uses other names.
+       */
+      sleepPatterns: ["sleeping", "asleep", "zzz", "_sleep"],
+      /** Notify via Telegram when the pet is found sleeping and woken. */
+      notifyOnWake: false,
+    },
+
+    // ── Honey settings ───────────────────────────────────────────────────────
+    honey: {
+      /**
+       * IMG src substrings that indicate a beehive is full / ready to collect.
+       * The script also matches beehive elements whose tooltip/aria text
+       * contains "full" or "collect".
+       */
+      fullPatterns: ["beehive_full", "honey_full", "beehive-full", "hive_full"],
+      /**
+       * Fallback: any <img> whose src contains a beehive pattern is
+       * considered ready when none of the fullPatterns match.
+       * Set false to only collect when a specific "full" sprite is visible.
+       */
+      collectIfAnyBeehive: true,
+    },
+
+    // ── Animal settings ──────────────────────────────────────────────────────
+    animals: {
+      /**
+       * IMG src substrings that appear as a floating speech-bubble / badge
+       * above a barn or coop when an animal wants to play.
+       * These are rendered directly on the farm DOM without opening the building.
+       * Extend with actual asset paths if you find others in the game.
+       */
+      playIndicatorPatterns: [
+        "want_to_play", "play_request", "play_icon",
+        "heart_bubble", "love_icon", "animal_heart",
+      ],
+      /**
+       * Names of toy items in your inventory (used to confirm you can play).
+       * If the inventory check is unavailable, the script still tries to click.
+       */
+      toyItems: ["Toy", "Ball", "Chicken Toy", "Cow Toy"],
     },
 
     // ── Resource settings ────────────────────────────────────────────────────
@@ -911,7 +960,7 @@
   // ─── Round summary (Telegram) ─────────────────────────────────────────────
   // ══════════════════════════════════════════════════════════════════════════
 
-  const _FEATURE_EMOJI = { CROPS: "🌾", FLOWERS: "🌸", RESOURCES: "⛏️", DIALOG: "💬", SYSTEM: "⚙️" };
+  const _FEATURE_EMOJI = { CROPS: "🌾", FLOWERS: "🌸", FRUITS: "🍎", RESOURCES: "⛏️", PET: "🐾", HONEY: "🍯", ANIMALS: "🐄", DIALOG: "💬", SYSTEM: "⚙️" };
 
   /**
    * Format _roundEvents into a human-readable summary string grouped by
@@ -1732,6 +1781,316 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // ─── FEATURE MODULE: PET ──────────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Find the pet element on the farm.
+   * Returns the clickable ancestor of the first pet <img> found, or null.
+   */
+  function _findPetElement() {
+    const candidates = Array.from(document.querySelectorAll("img[src]")).filter(function (img) {
+      const src = (img.src || "").toLowerCase();
+      const rect = img.getBoundingClientRect();
+      return (
+        rect.width > 0 && rect.height > 0 &&
+        (src.includes("/pet/") || src.includes("/pets/") ||
+         src.includes("_pet.") || src.includes("cat.") || src.includes("dog."))
+      );
+    });
+    if (candidates.length === 0) return null;
+    const img = candidates[0];
+    let el = img.parentElement;
+    for (let i = 0; i < 6 && el; i++) {
+      if (el.getAttribute("role") === "button" || el.classList.contains("cursor-pointer")) return el;
+      el = el.parentElement;
+    }
+    return img.parentElement || img;
+  }
+
+  /**
+   * Returns true when the pet's current image src matches a sleeping pattern.
+   * Also checks aria-label / title attributes as fallbacks.
+   */
+  function _isPetSleeping(petEl) {
+    if (!petEl) return false;
+    const img = petEl.querySelector ? petEl.querySelector("img[src]") : petEl;
+    if (!img) return false;
+    const src   = (img.src || "").toLowerCase();
+    const label = (
+      (petEl.getAttribute && petEl.getAttribute("aria-label")) ||
+      (petEl.title) || ""
+    ).toLowerCase();
+    const patterns = CONFIG.pet.sleepPatterns || [];
+    return patterns.some(function (p) {
+      return src.includes(p.toLowerCase()) || label.includes(p.toLowerCase());
+    });
+  }
+
+  /**
+   * Wake the sleeping pet by clicking it, then wait for the animation
+   * to resolve.  Sends a Telegram notification if configured.
+   */
+  async function runPetRound() {
+    if (isCaptchaVisible()) {
+      log("PET", "warn", "Captcha detected – skipping pet round.");
+      return;
+    }
+
+    const petEl = _findPetElement();
+    if (!petEl) {
+      log("PET", "info", "No pet found on this page.");
+      return;
+    }
+
+    if (_isPetSleeping(petEl)) {
+      log("PET", "info", "Pet is sleeping – waking it up…");
+      simulateClick(petEl);
+      await randomDelay();
+
+      // Dismiss any reward/animation dialog that may appear after waking.
+      if (isGameDialogVisible()) await _dismissDialogs();
+
+      log("PET", "ok", "Pet woken up.");
+      if (CONFIG.pet.notifyOnWake && CONFIG.logging.telegram.enabled) {
+        await sendTelegramImmediate("🐾 Pet was sleeping – woke it up.");
+      }
+    } else {
+      log("PET", "info", "Pet is awake – nothing to do.");
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ─── FEATURE MODULE: HONEY ────────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Find all beehive elements on the farm that appear ready to collect.
+   *
+   * Detection strategy (two passes):
+   *   1. Look for imgs whose src matches one of CONFIG.honey.fullPatterns
+   *      (specific "full/ready" sprite).
+   *   2. If CONFIG.honey.collectIfAnyBeehive is true, also include any
+   *      beehive img not already matched — the game may not change the sprite
+   *      name but the honey bar tooltip/title will say "full".
+   *
+   * Returns an array of clickable ancestor elements.
+   */
+  function _findFullBeehives() {
+    const fullPatterns = CONFIG.honey.fullPatterns || [];
+
+    // Helper to walk up to clickable ancestor
+    function _beehiveClickable(img) {
+      let el = img.parentElement;
+      for (let i = 0; i < 6 && el; i++) {
+        if (el.getAttribute("role") === "button" || el.classList.contains("cursor-pointer")) return el;
+        el = el.parentElement;
+      }
+      return img.parentElement || img;
+    }
+
+    const all = Array.from(document.querySelectorAll("img[src]")).filter(function (img) {
+      const src  = (img.src || "").toLowerCase();
+      const rect = img.getBoundingClientRect();
+      return (
+        rect.width > 0 && rect.height > 0 &&
+        (src.includes("beehive") || src.includes("bee_hive") || src.includes("honey_hive"))
+      );
+    });
+
+    // Pass 1: confirmed "full" sprites
+    const fullImgs = all.filter(function (img) {
+      const src = (img.src || "").toLowerCase();
+      return fullPatterns.some(function (p) { return src.includes(p.toLowerCase()); });
+    });
+
+    // Pass 2: fallback – any beehive if configured
+    const fallbackImgs = CONFIG.honey.collectIfAnyBeehive
+      ? all.filter(function (img) {
+          return !fullImgs.includes(img);
+        })
+      : [];
+
+    return [...fullImgs, ...fallbackImgs].map(_beehiveClickable).filter(Boolean);
+  }
+
+  /**
+   * Collect all ready beehives.
+   *
+   * A beeswarm dialogue may appear after clicking — this is already handled
+   * by `_dismissDialogs()` because the existing selector `[class*='swarm']`
+   * matches it.  No special-case code is needed here.
+   */
+  async function runHoneyRound() {
+    if (isCaptchaVisible()) {
+      log("HONEY", "warn", "Captcha detected – skipping honey round.");
+      return;
+    }
+
+    const hives = _findFullBeehives();
+    if (hives.length === 0) {
+      log("HONEY", "info", "No full beehives found.");
+      return;
+    }
+
+    log("HONEY", "info", `Found ${hives.length} beehive(s) ready to collect.`);
+    let collected = 0;
+
+    for (const hive of hives) {
+      if (stopped) return;
+
+      if (isGameDialogVisible()) await _dismissDialogs();
+      if (stopped) return;
+
+      try {
+        simulateClick(hive);
+        await randomDelay();
+        collected++;
+        log("HONEY", "ok", "Clicked beehive to collect honey.");
+
+        // Beeswarm / any post-click dialog is dismissed here.
+        // The existing _dismissDialogs() already handles [class*='swarm'] and
+        // "Collect" / "Continue" buttons, so this covers the beeswarm overlay.
+        if (isGameDialogVisible()) await _dismissDialogs();
+      } catch (err) {
+        recordError("HONEY", `Beehive action failed: ${err.message || err}`);
+      }
+    }
+
+    log("HONEY", "info", `Honey round done – collected from ${collected} hive(s).`);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ─── FEATURE MODULE: ANIMALS (play) ──────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * ─── Why we do NOT open the barn/coop ────────────────────────────────────
+   *
+   * Opening a building to check every animal is slow, makes the bot highly
+   * visible, and triggers game dialog state unnecessarily.
+   *
+   * Instead we detect the floating play-request indicators that the game
+   * renders ABOVE barn / coop buildings on the main farm view.  In SFL these
+   * are typically small heart / star / speech-bubble sprites that appear as
+   * <img> elements at absolute positions near the building's bounding box.
+   * No barn click is required — the badge is visible directly on the farm DOM.
+   *
+   * If the game updates its asset paths the patterns in
+   * CONFIG.animals.playIndicatorPatterns can be extended without code changes.
+   */
+
+  /**
+   * Returns all visible "play request" indicator elements currently rendered
+   * on the farm for any animal building.
+   */
+  function _findAnimalPlayIndicators() {
+    const patterns = CONFIG.animals.playIndicatorPatterns || [];
+    if (patterns.length === 0) return [];
+
+    return Array.from(document.querySelectorAll("img[src]")).filter(function (img) {
+      const src  = (img.src || "").toLowerCase();
+      const rect = img.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+      return patterns.some(function (p) { return src.includes(p.toLowerCase()); });
+    }).map(function (img) {
+      // Walk up to the clickable ancestor for the indicator.
+      let el = img.parentElement;
+      for (let i = 0; i < 6 && el; i++) {
+        if (el.getAttribute("role") === "button" || el.classList.contains("cursor-pointer")) return el;
+        el = el.parentElement;
+      }
+      return img.parentElement || img;
+    }).filter(Boolean);
+  }
+
+  /**
+   * Returns true if the player has at least one toy in their inventory.
+   * Falls back to true when the inventory is unavailable (best-effort click).
+   */
+  function _hasToys() {
+    const inv   = getInventory();
+    const toys  = CONFIG.animals.toyItems || [];
+    if (Object.keys(inv).length === 0) return true; // inventory not available – try anyway
+    return toys.some(function (t) { return (inv[t] || 0) >= 1; });
+  }
+
+  /**
+   * After clicking a play indicator the game typically opens a small "play"
+   * dialog or action panel.  Try to find and click the toy/play action button.
+   * Returns true when a button was clicked.
+   */
+  async function _clickToyButton() {
+    await _sleepMs(500); // brief wait for panel to appear
+    const toyKeywords = ["play", "toy", "throw", "give"];
+    const btns = Array.from(document.querySelectorAll(
+      "button, [role='button'], [class*='btn'], [class*='action']"
+    )).filter(function (el) {
+      const t    = (el.textContent || el.getAttribute("aria-label") || "").toLowerCase();
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && toyKeywords.some(function (kw) { return t.includes(kw); });
+    });
+    if (btns.length > 0) {
+      simulateClick(btns[0]);
+      await randomDelay();
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Use toys on all animals that are currently showing a play-request badge.
+   * No building is opened — the check is entirely based on the floating
+   * indicator images visible on the farm.
+   */
+  async function runAnimalsRound() {
+    if (isCaptchaVisible()) {
+      log("ANIMALS", "warn", "Captcha detected – skipping animals round.");
+      return;
+    }
+
+    const indicators = _findAnimalPlayIndicators();
+    if (indicators.length === 0) {
+      log("ANIMALS", "info", "No animals requesting play found.");
+      return;
+    }
+
+    if (!_hasToys()) {
+      log("ANIMALS", "warn", "Animals want to play but no toys in inventory – skipping.");
+      return;
+    }
+
+    log("ANIMALS", "info", `Found ${indicators.length} animal(s) wanting to play.`);
+    let played = 0;
+
+    for (const indicator of indicators) {
+      if (stopped) return;
+
+      if (isGameDialogVisible()) await _dismissDialogs();
+      if (stopped) return;
+
+      try {
+        simulateClick(indicator);
+        await randomDelay();
+
+        // Try to click the toy/play action that appears after the indicator click.
+        const didPlay = await _clickToyButton();
+        if (didPlay) {
+          played++;
+          log("ANIMALS", "ok", "Used toy on animal.");
+        } else {
+          // Dismiss any popup that opened (e.g. info panel without a play button).
+          if (isGameDialogVisible()) await _dismissDialogs();
+        }
+      } catch (err) {
+        recordError("ANIMALS", `Animal play action failed: ${err.message || err}`);
+      }
+    }
+
+    log("ANIMALS", "info", `Animals round done – played with ${played} animal(s).`);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // ─── FEATURE MODULE: RESOURCES ────────────────────────────────────────────
   // ══════════════════════════════════════════════════════════════════════════
 
@@ -2217,6 +2576,16 @@
       const ready = _findFruitTrees().filter(_isFruitReady).length;
       lines.push(`  Fruits ready:  ${ready}`);
     }
+    if (CONFIG.features.honey) {
+      lines.push(`  Beehives rdy:  ${_findFullBeehives().length}`);
+    }
+    if (CONFIG.features.pet) {
+      const petEl = _findPetElement();
+      lines.push(`  Pet sleeping:  ${petEl ? (_isPetSleeping(petEl) ? "yes" : "no") : "n/a"}`);
+    }
+    if (CONFIG.features.animals) {
+      lines.push(`  Animals play:  ${_findAnimalPlayIndicators().length}`);
+    }
     for (const type of Object.keys(RESOURCE_DEFS)) {
       if (CONFIG.features.resources[type]) {
         lines.push(`  ${type.padEnd(10)} ready: ${findAvailableResources(type).length}`);
@@ -2426,6 +2795,9 @@
       `     crops:     ${CONFIG.features.crops}\n` +
       `     flowers:   ${CONFIG.features.flowers}\n` +
       `     fruits:    ${CONFIG.features.fruits}\n` +
+      `     pet:       ${CONFIG.features.pet}\n` +
+      `     honey:     ${CONFIG.features.honey}\n` +
+      `     animals:   ${CONFIG.features.animals}\n` +
       `     resources: ${JSON.stringify(CONFIG.features.resources)}\n` +
       "   Run  stopAutotest()  to stop at any time."
     );
@@ -2434,7 +2806,7 @@
     if (CONFIG.logging.telegram.enabled) {
       sendTelegramImmediate(
         "🌻 Sunflower Land Autotest started.\n" +
-        `Features: crops=${CONFIG.features.crops} flowers=${CONFIG.features.flowers} fruits=${CONFIG.features.fruits}\n` +
+        `Features: crops=${CONFIG.features.crops} flowers=${CONFIG.features.flowers} fruits=${CONFIG.features.fruits} pet=${CONFIG.features.pet} honey=${CONFIG.features.honey} animals=${CONFIG.features.animals}\n` +
         `Resources: ${Object.entries(CONFIG.features.resources).filter(([,v])=>v).map(([k])=>k).join(", ")}\n` +
         (CONFIG.logging.telegram.listenForCommands
           ? "Commands: send 'stop' to pause · 'start' to resume"
@@ -2491,6 +2863,20 @@
       if (!stopped && !paused && CONFIG.features.fruits) {
         await _dismissDialogs();
         await runFruitsRound();
+        await _humanMouseDrift();
+      }
+      if (!stopped && !paused && CONFIG.features.pet) {
+        await _dismissDialogs();
+        await runPetRound();
+      }
+      if (!stopped && !paused && CONFIG.features.honey) {
+        await _dismissDialogs();
+        await runHoneyRound();
+        await _humanMouseDrift();
+      }
+      if (!stopped && !paused && CONFIG.features.animals) {
+        await _dismissDialogs();
+        await runAnimalsRound();
         await _humanMouseDrift();
       }
       if (!stopped && !paused) {
