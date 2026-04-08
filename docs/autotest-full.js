@@ -629,11 +629,12 @@
   }
 
   /**
-   * Returns true if a countdown timer element is visible anywhere in the page.
-   * Used to decide whether to wait before trying to dismiss a dialog.
+   * Returns true if a countdown timer element is visible inside `el` (or
+   * anywhere on the page if no element is given).
    */
-  function _dialogHasTimer() {
-    const timerEl = document.querySelector(
+  function _elementHasTimer(el) {
+    const scope = el || document;
+    const timerEl = scope.querySelector(
       "[class*='timer'], [class*='countdown'], [class*='clock']"
     );
     if (timerEl) {
@@ -654,78 +655,157 @@
   ];
 
   /**
-   * Attempt to dismiss any visible game dialog or popup by clicking the first
-   * recognisable action button.  Repeats until the dialog disappears or
-   * CONFIG.dialog.maxDismissAttempts is reached.
+   * Collect all distinct dialog/popup root elements that are currently visible
+   * in the DOM (excluding captcha overlays).  Returns them sorted so that
+   * popups WITHOUT a countdown timer come first – those can be dismissed
+   * immediately.  Timer-based popups (e.g. goblin swarm) are handled last so
+   * we can collect rewards / close other alerts while the timer expires.
+   */
+  function _collectVisibleDialogs() {
+    const roots = Array.from(document.querySelectorAll(
+      "[role='dialog'], [aria-modal='true'], " +
+      "[class*='modal']:not([class*='captcha']), " +
+      "[class*='dialog']:not([class*='captcha']), " +
+      "[class*='popup']:not([class*='captcha']), " +
+      "[class*='goblin'], [class*='swarm'], " +
+      "[class*='event-modal'], [class*='reward-modal'], " +
+      "[class*='notification-modal'], " +
+      "[class*='overlay'][class*='panel']"
+    )).filter(function (el) {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+
+    // Deduplicate: remove any element that is a descendant of another element
+    // in the list (keep only the outermost containers).
+    const unique = roots.filter(function (el) {
+      return !roots.some(function (other) {
+        return other !== el && other.contains(el);
+      });
+    });
+
+    // Sort: dialogs WITHOUT a visible timer come first so they can be dismissed
+    // before we wait for goblin-swarm timers.
+    unique.sort(function (a, b) {
+      return (_elementHasTimer(a) ? 1 : 0) - (_elementHasTimer(b) ? 1 : 0);
+    });
+
+    return unique;
+  }
+
+  /**
+   * Try to dismiss a single dialog element `dlg` by clicking the first
+   * recognisable action button found inside it (falling back to global scope).
+   * Returns true when a button was clicked, false when none was found.
+   */
+  async function _dismissOneDialog(dlg) {
+    // Gather buttons scoped to this dialog first, then any globally visible ones.
+    const inDialog = Array.from(dlg.querySelectorAll(
+      "button, [role='button'], [class*='btn'], a[class*='action']"
+    )).filter(function (el) {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+
+    const outside = Array.from(document.querySelectorAll(
+      "button, [role='button'], [class*='btn'], a[class*='action']"
+    )).filter(function (el) {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && !dlg.contains(el);
+    });
+
+    // In-dialog buttons take priority so we target the right popup.
+    const buttons = inDialog.concat(outside);
+
+    // 1. Labelled dismiss button.
+    for (const label of _DISMISS_LABELS) {
+      const btn = buttons.find(function (el) {
+        const t = (el.textContent || el.value || el.getAttribute("aria-label") || "")
+          .trim().toLowerCase();
+        return t === label.toLowerCase() || t.startsWith(label.toLowerCase());
+      });
+      if (btn) {
+        log("DIALOG", "ok",
+          `Dismissed popup – clicked "${(btn.textContent || "").trim().slice(0, 40)}"`);
+        simulateClick(btn);
+        await _sleepMs(randInt(CONFIG.dialog.dismissDelayMs.min, CONFIG.dialog.dismissDelayMs.max));
+        return true;
+      }
+    }
+
+    // 2. Close-icon / X button.
+    const closeSelectors =
+      "button[aria-label='Close'], button[aria-label='close'], " +
+      "[class*='close-btn'], [class*='modal-close'], [class*='dialog-close']";
+    const closeBtn =
+      dlg.querySelector(closeSelectors) ||
+      document.querySelector(closeSelectors);
+    if (closeBtn && closeBtn.getBoundingClientRect().width > 0) {
+      log("DIALOG", "ok", "Dismissed popup – clicked close/X button.");
+      simulateClick(closeBtn);
+      await _sleepMs(randInt(CONFIG.dialog.dismissDelayMs.min, CONFIG.dialog.dismissDelayMs.max));
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Attempt to dismiss ALL currently visible game dialogs/popups.
    *
-   * If a countdown timer is detected the script waits timerWaitMs first so
-   * the timer can expire naturally.
+   * Multiple simultaneous overlays (goblin swarm + chest reward + bot-detect)
+   * are handled in priority order each pass:
    *
-   * Also handles close-button icons (×, ✕) and [aria-label="Close"] buttons.
+   *   1. If ONLY a captcha is visible → return immediately (human must solve it).
+   *   2. Non-timer dialogs (rewards, event notifications) → dismissed first.
+   *   3. Timer-based dialogs (goblin swarm countdown) → wait, then dismiss.
+   *
+   * The outer loop repeats until no dismissable dialog remains or the attempt
+   * limit is reached, so ALL stacked popups are cleared in one call.
    */
   async function _dismissDialogs() {
     if (!CONFIG.dialog.handleDialogs) return;
 
     let attempts = 0;
+
     while (attempts < CONFIG.dialog.maxDismissAttempts && !stopped) {
-      if (!isGameDialogVisible() && !isCaptchaVisible()) break;
-
-      if (_dialogHasTimer()) {
-        log("SYSTEM", "info",
-          `Dialog has timer – waiting ${CONFIG.dialog.timerWaitMs / 1000} s…`);
-        await _sleepMs(CONFIG.dialog.timerWaitMs);
+      // If a captcha is the ONLY thing visible, we cannot auto-dismiss it.
+      if (isCaptchaVisible() && !isGameDialogVisible()) {
+        log("SYSTEM", "warn", "Captcha / bot-detection visible – waiting for human action.");
+        return;
       }
 
-      // Collect all clickable elements currently in the DOM.
-      const buttons = Array.from(document.querySelectorAll(
-        "button, [role='button'], [class*='btn'], a[class*='action']"
-      )).filter(function (el) {
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0; // only visible elements
-      });
+      if (!isGameDialogVisible()) break;
 
-      let clicked = false;
+      const dialogs = _collectVisibleDialogs();
+      if (dialogs.length === 0) break;
 
-      // 1. Look for a labelled dismiss button.
-      for (const label of _DISMISS_LABELS) {
-        const btn = buttons.find(function (el) {
-          const t = (el.textContent || el.value || el.getAttribute("aria-label") || "")
-            .trim().toLowerCase();
-          return t === label.toLowerCase() || t.startsWith(label.toLowerCase());
-        });
-        if (btn) {
-          log("DIALOG", "ok", `Dismissed popup – clicked "${btn.textContent.trim().slice(0, 40)}"`);
-          simulateClick(btn);
-          await _sleepMs(randInt(CONFIG.dialog.dismissDelayMs.min, CONFIG.dialog.dismissDelayMs.max));
-          clicked = true;
-          break;
+      let anyClicked = false;
+
+      for (const dlg of dialogs) {
+        if (stopped) return;
+
+        // If this dialog has a live timer, wait for it before dismissing.
+        if (_elementHasTimer(dlg)) {
+          log("SYSTEM", "info",
+            `Dialog has timer – waiting ${CONFIG.dialog.timerWaitMs / 1000} s…`);
+          await _sleepMs(CONFIG.dialog.timerWaitMs);
         }
+
+        const clicked = await _dismissOneDialog(dlg);
+        if (clicked) anyClicked = true;
       }
 
-      // 2. Fall back to close-icon buttons (×, ✕, aria-label="Close").
-      if (!clicked) {
-        const closeBtn = document.querySelector(
-          "button[aria-label='Close'], button[aria-label='close'], " +
-          "[class*='close-btn'], [class*='modal-close'], [class*='dialog-close']"
-        );
-        if (closeBtn && closeBtn.getBoundingClientRect().width > 0) {
-          log("DIALOG", "ok", "Dismissed popup – clicked close/X button.");
-          simulateClick(closeBtn);
-          await _sleepMs(randInt(CONFIG.dialog.dismissDelayMs.min, CONFIG.dialog.dismissDelayMs.max));
-          clicked = true;
-        }
-      }
-
-      if (!clicked) {
-        // No known dismiss button found; the dialog may require user action.
-        log("SYSTEM", "warn", "Dialog visible but no dismiss button found – waiting…");
+      if (!anyClicked) {
+        // No button found in any visible dialog – wait a moment before retrying.
+        log("SYSTEM", "warn", "Dialog(s) visible but no dismiss button found – waiting…");
         await _sleepMs(CONFIG.dialog.timerWaitMs);
       }
 
       attempts++;
     }
 
-    if (attempts > 0 && isGameDialogVisible()) {
+    if (isGameDialogVisible()) {
       log("SYSTEM", "warn",
         `Dialog still visible after ${attempts} attempt(s) – continuing anyway.`);
     }
@@ -1706,10 +1786,45 @@
     simulateClick(toolItem);
     await randomDelay();
 
-    // Increase quantity using the "+" button if we need more than 1.
-    if (qty > 1) {
+    // SFL's purchase panel shows "Buy 1" and "Buy 10" buttons.
+    // Calculate how many clicks of each we need to reach `qty`.
+    // Fall back to the old "+" increment button when neither is found.
+    const allBtns = Array.from(document.querySelectorAll(
+      "button, [role='button'], [class*='btn']"
+    )).filter(function (el) {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+
+    function _findBuyQtyBtn(labelFragment) {
+      return allBtns.find(function (el) {
+        const t = (el.textContent || el.getAttribute("aria-label") || "").trim().toLowerCase();
+        return t === labelFragment || t.includes(labelFragment);
+      }) || null;
+    }
+
+    const buy10Btn = _findBuyQtyBtn("buy 10") || _findBuyQtyBtn("10");
+    const buy1Btn  = _findBuyQtyBtn("buy 1")  || _findBuyQtyBtn("×1") || _findBuyQtyBtn("x1");
+
+    if (buy10Btn || buy1Btn) {
+      // Use discrete Buy-10 / Buy-1 buttons.
+      const tens = Math.floor(qty / 10);
+      const ones = qty % 10;
+      for (let i = 0; i < tens; i++) {
+        simulateClick(buy10Btn);
+        await _sleepMs(200);
+      }
+      for (let i = 0; i < ones; i++) {
+        simulateClick(buy1Btn || buy10Btn); // buy1Btn fallback to buy10 if only that exists
+        await _sleepMs(200);
+      }
+      log("RESOURCES", "info",
+        `Set quantity to ${qty} (${tens}×Buy10 + ${ones}×Buy1) for ${toolName}.`);
+    } else if (qty > 1) {
+      // Legacy: use the "+" increment button.
       const plusBtn = document.querySelector(
-        "[aria-label*='increase'], [aria-label*='plus'], button[class*='plus'], button[class*='increment']"
+        "[aria-label*='increase'], [aria-label*='plus'], " +
+        "button[class*='plus'], button[class*='increment']"
       );
       if (plusBtn) {
         for (let i = 1; i < qty; i++) {
