@@ -125,6 +125,13 @@
         /** Flush buffered messages every N seconds (0 = immediate) */
         flushIntervalSec: 30,
       },
+      /**
+       * IANA timezone for log timestamps.
+       * Examples: "Asia/Bangkok" (UTC+7), "Asia/Ho_Chi_Minh" (UTC+7),
+       *           "America/New_York", "Europe/London", "UTC"
+       * Set to "" or null to use the browser's local timezone.
+       */
+      timezone: "Asia/Bangkok",   // UTC+7
     },
 
     /**
@@ -272,8 +279,14 @@
   const _tgBuffer       = [];
   let   _tgFlushTimer   = null;
 
-  /** Return current time as HH:MM:SS */
+  /** Return current time as HH:MM:SS in the configured timezone (default UTC+7) */
   function _timestamp() {
+    const tz = CONFIG.logging.timezone;
+    if (tz) {
+      try {
+        return new Date().toLocaleTimeString("en-GB", { timeZone: tz, hour12: false });
+      } catch (_) { /* fall through to local time on invalid tz */ }
+    }
     return new Date().toTimeString().slice(0, 8);
   }
 
@@ -439,13 +452,14 @@
    * We look for common Cloudflare / reCAPTCHA / reward-dialog selectors.
    */
   function isCaptchaVisible() {
+    // NOTE: do NOT check [data-html2canvas-ignore] – the game attaches that
+    // attribute to its own permanent HUD elements (balance bar, nav, etc.)
+    // which are always in the DOM, causing every round to be skipped.
     return !!(
       document.querySelector("[id*='captcha']")          ||
       document.querySelector("[class*='captcha']")       ||
       document.querySelector("iframe[src*='recaptcha']") ||
-      document.querySelector("iframe[src*='challenges.cloudflare']") ||
-      // Game-specific: a modal that isn't the shop/HUD
-      document.querySelector("[data-html2canvas-ignore]") // common overlay pattern
+      document.querySelector("iframe[src*='challenges.cloudflare']")
     );
   }
 
