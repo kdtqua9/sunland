@@ -124,6 +124,14 @@
         chatId: "",     // "-1001234567890" or your personal chat ID
         /** Flush buffered messages every N seconds (0 = immediate) */
         flushIntervalSec: 30,
+        /**
+         * When true, the script polls the Telegram bot for incoming messages
+         * every ~30 s and stops immediately if a "stop" or "/stop" message
+         * is received from the configured chatId.
+         * Only messages from the exact chatId are accepted – other chats
+         * are silently ignored.
+         */
+        listenForStop: true,
       },
       /**
        * IANA timezone for log timestamps.
@@ -278,6 +286,8 @@
   const _logBuffer      = [];
   const _tgBuffer       = [];
   let   _tgFlushTimer   = null;
+  // Tracks the next update_id offset for getUpdates polling (stop-command listener).
+  let   _tgUpdateOffset = 0;
 
   /** Return current time as HH:MM:SS in the configured timezone (default UTC+7) */
   function _timestamp() {
@@ -373,8 +383,51 @@
     }
   }
 
+  /**
+   * Poll Telegram getUpdates for incoming messages.
+   * If a "stop" or "/stop" message arrives from the configured chatId,
+   * the autotest is halted and a confirmation is sent back to Telegram.
+   * Messages from other chats are silently ignored.
+   * No-op when Telegram is disabled or listenForStop is false.
+   */
+  async function _pollTelegramStop() {
+    const tg = CONFIG.logging.telegram;
+    if (!tg.enabled || !tg.listenForStop || !tg.botToken || !tg.chatId) return;
+    try {
+      const url =
+        `https://api.telegram.org/bot${tg.botToken}/getUpdates` +
+        `?offset=${_tgUpdateOffset}&limit=20&timeout=0` +
+        `&allowed_updates=%5B%22message%22%5D`;  // ["message"] URL-encoded
+      const resp = await fetch(url);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (!data.ok || !Array.isArray(data.result)) return;
+
+      for (const upd of data.result) {
+        // Always advance the offset so we never re-process the same update.
+        _tgUpdateOffset = upd.update_id + 1;
+
+        const msg = upd.message || upd.channel_post;
+        if (!msg) continue;
+
+        // Only accept commands from the exact configured chatId.
+        const fromId = String(msg.chat && msg.chat.id);
+        if (fromId !== String(tg.chatId)) continue;
+
+        const text = (msg.text || "").trim().toLowerCase();
+        if (text === "stop" || text === "/stop") {
+          log("SYSTEM", "info", "🛑 Received 'stop' command from Telegram – stopping autotest.");
+          await sendTelegramImmediate("🛑 Stop command received. Autotest is shutting down…");
+          await window.stopAutotest();
+          return;
+        }
+      }
+    } catch (_) {
+      // Network errors are silently ignored to avoid polluting the log.
+    }
+  }
+
   function _scheduleTgFlush() {
-    if (_tgFlushTimer) return;
     const intervalMs = (CONFIG.logging.telegram.flushIntervalSec || 30) * 1000;
     if (intervalMs === 0) {
       // Immediate
@@ -1158,9 +1211,6 @@
 
     log("RESOURCES", "info", `[${type}] Found ${imgs.length} available.`);
 
-    // Noise factor for proportional jitter (matches mini-snippet NOISE_FACTOR).
-    const NOISE = 0.35;
-
     let count = 0;
     for (let i = 0; i < imgs.length; i++) {
       if (stopped) break;
@@ -1186,22 +1236,27 @@
           const preDelay = randInt(600, 1200);
           await _sleepMs(preDelay);
 
-          // Re-read the bounding rect of the img each hit.
-          const rect = img.getBoundingClientRect();
+          // Use the clickTarget's bounding rect for the centre coordinate.
+          // This avoids the large-sprite-sheet problem: stone/iron <img> elements
+          // are often sized as full animation sheets (300-400 px wide), causing
+          // NOISE-based jitter to scatter clicks 100+ px from the visible sprite.
+          // The cursor-pointer ancestor div is sized to the actual game tile.
+          const rect = clickTarget.getBoundingClientRect();
           const cx   = rect.left + rect.width  / 2;
           const cy   = rect.top  + rect.height / 2;
-          const nx   = (Math.random() * 2 - 1) * rect.width  * NOISE;
-          const ny   = (Math.random() * 2 - 1) * rect.height * NOISE;
+          // Cap jitter at coordNoisePixels (default 8 px) so clicks always land
+          // within the resource tile regardless of how large rect is.
+          const cap  = CONFIG.delay.coordNoisePixels;
+          const nx   = (Math.random() * 2 - 1) * cap;
+          const ny   = (Math.random() * 2 - 1) * cap;
           const x    = cx + nx;
           const y    = cy + ny;
 
-          // Dispatch click directly on the cursor-pointer ancestor.
-          clickTarget.dispatchEvent(new MouseEvent("click", {
-            bubbles: true, cancelable: true, view: window,
-            clientX: x, clientY: y,
-            screenX: x + (window.screenX || 0),
-            screenY: y + (window.screenY || 0),
-          }));
+          // Use simulateClickAt which fires the full pointer+mouse event sequence
+          // (pointerdown → mousedown → pointerup → mouseup → click) via
+          // document.elementFromPoint.  A bare MouseEvent("click") does NOT
+          // trigger React's pointerdown handlers that the game relies on.
+          simulateClickAt(x, y);
           hitCoords.push(`(${Math.round(x)},${Math.round(y)})`);
         }
         count++;
@@ -1332,6 +1387,10 @@
       // ── Pre-check summary ────────────────────────────────────────────────
       logYieldSummary();
 
+      // ── Check for Telegram stop command before starting modules ─────────
+      await _pollTelegramStop();
+      if (stopped) break;
+
       // ── Run enabled modules ──────────────────────────────────────────────
       if (!stopped && CONFIG.features.crops)     await runCropsRound();
       if (!stopped && CONFIG.features.flowers)   await runFlowersRound();
@@ -1352,6 +1411,8 @@
         const chunk = Math.min(POLL, waitMs - elapsed);
         await sleep(chunk);
         elapsed += chunk;
+        // Poll for Telegram "stop" command during the inter-round wait.
+        await _pollTelegramStop();
         if (!stopped && elapsed < waitMs) {
           const remaining = ((waitMs - elapsed) / 60_000).toFixed(1);
           log("SYSTEM", "info", `⏳ ~${remaining} min until next round.`);
