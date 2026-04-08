@@ -1123,18 +1123,123 @@
    * Attempts to read the exposed game-state object.
    * Returns null when unavailable (graceful degradation).
    */
+  /**
+   * Walk a React fiber tree rooted at `node`, depth-first, up to `maxDepth`
+   * levels, looking for an XState machine context that contains an inventory.
+   * Returns the context object or null.
+   */
+  function _walkFiberForGameState(node, maxDepth) {
+    if (!node || maxDepth <= 0) return null;
+    try {
+      // memoizedState is a linked list of hook states for function components.
+      // XState's useMachine hook stores { machine, state, service } or the
+      // machine context on one of the hook nodes.
+      let hook = node.memoizedState;
+      while (hook) {
+        const val = hook.memoizedState;
+        // XState service-like objects have a getSnapshot / state property
+        if (val && typeof val === "object") {
+          // Direct context with inventory
+          const ctx = val.context || val.state?.context || val;
+          if (ctx && typeof ctx === "object" && ctx.inventory &&
+              typeof ctx.inventory === "object") {
+            return ctx;
+          }
+          // XState service: { machine, state: { context } }
+          if (val.state && val.state.context &&
+              typeof val.state.context.inventory === "object") {
+            return val.state.context;
+          }
+        }
+        hook = hook.next;
+      }
+    } catch (_) {}
+
+    // Recurse into children and siblings (breadth of recursion limited by maxDepth)
+    try {
+      const child  = _walkFiberForGameState(node.child,   maxDepth - 1);
+      if (child) return child;
+      const sib    = _walkFiberForGameState(node.sibling, maxDepth - 1);
+      if (sib) return sib;
+    } catch (_) {}
+    return null;
+  }
+
+  /** Cache for the React fiber key prefix (avoids repeated key scanning). */
+  let _fiberKeyPrefix = null;
+
+  /**
+   * Try to obtain the game state from the React fiber tree.
+   * Sunflower Land uses XState + React; the machine context lives in a hook
+   * node's memoizedState chain somewhere near the root component.
+   */
+  function _getGameStateFromFiber() {
+    try {
+      const root = document.getElementById("root") || document.body;
+      // Discover the React internal key (e.g. "__reactFiber$abc123")
+      if (!_fiberKeyPrefix) {
+        _fiberKeyPrefix = Object.keys(root).find(function (k) {
+          return k.startsWith("__reactFiber$") || k.startsWith("_reactFiber");
+        }) || null;
+      }
+      if (!_fiberKeyPrefix) return null;
+      const fiberNode = root[_fiberKeyPrefix];
+      return _walkFiberForGameState(fiberNode, 40);
+    } catch (_) { return null; }
+  }
+
+  /**
+   * Try to obtain the game state from localStorage.
+   * SFL persists portions of the state under keys that contain "sunflower",
+   * "farm", or "game".  We look for an object with an `inventory` field.
+   */
+  function _getGameStateFromLocalStorage() {
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key) continue;
+        const kl = key.toLowerCase();
+        if (!kl.includes("sunflower") && !kl.includes("farm") &&
+            !kl.includes("game") && !kl.includes("sfl")) continue;
+        try {
+          const raw = localStorage.getItem(key);
+          if (!raw) continue;
+          const obj = JSON.parse(raw);
+          // Accept if it has an inventory map at any common location
+          const inv =
+            obj?.state?.inventory ||
+            obj?.context?.inventory ||
+            obj?.inventory;
+          if (inv && typeof inv === "object" && Object.keys(inv).length > 0) {
+            return obj?.state || obj?.context || obj;
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+    return null;
+  }
+
   function getGameState() {
     try {
-      // Various common patterns used by React / XState game clients
-      if (window.__GAME_STATE__)       return window.__GAME_STATE__;
-      if (window.__SFL_GAME_STATE__)   return window.__SFL_GAME_STATE__;
-      // XState inspector sometimes exposes services
+      // Strategy 1 – well-known global shortcuts (set by some SFL forks / dev builds)
+      if (window.__GAME_STATE__)     return window.__GAME_STATE__;
+      if (window.__SFL_GAME_STATE__) return window.__SFL_GAME_STATE__;
+
+      // Strategy 2 – XState inspector global (present in development mode)
       if (window.__xstate__ && window.__xstate__.services) {
         for (const svc of Object.values(window.__xstate__.services)) {
           const ctx = svc?.state?.context;
           if (ctx && (ctx.state || ctx.inventory)) return ctx;
         }
       }
+
+      // Strategy 3 – React fiber walk (works in production SFL)
+      const fromFiber = _getGameStateFromFiber();
+      if (fromFiber) return fromFiber;
+
+      // Strategy 4 – localStorage (SFL persists farm state)
+      const fromLS = _getGameStateFromLocalStorage();
+      if (fromLS) return fromLS;
     } catch (_) {}
     return null;
   }
@@ -1160,21 +1265,68 @@
   /**
    * Returns a map of { itemName: quantity } from the current inventory,
    * or an empty object when unavailable.
+   *
+   * Falls back to DOM scraping when the game state cannot be read via JS.
    */
   function getInventory() {
+    // ── Strategy A: game state object ────────────────────────────────────────
     try {
       const gs = getGameState();
-      if (!gs) return {};
-      const inv = gs.state?.inventory || gs.inventory || {};
-      // Decimal.js values – convert to plain numbers
-      const result = {};
-      for (const [k, v] of Object.entries(inv)) {
-        result[k] = typeof v === "object" && v !== null
-          ? (parseFloat(v.toString()) || 0)
-          : (Number(v) || 0);
+      if (gs) {
+        const inv = gs.state?.inventory || gs.inventory || {};
+        if (Object.keys(inv).length > 0) {
+          // Decimal.js values – convert to plain numbers
+          const result = {};
+          for (const [k, v] of Object.entries(inv)) {
+            result[k] = typeof v === "object" && v !== null
+              ? (parseFloat(v.toString()) || 0)
+              : (Number(v) || 0);
+          }
+          return result;
+        }
       }
-      return result;
-    } catch (_) { return {}; }
+    } catch (_) {}
+
+    // ── Strategy B: DOM scrape ────────────────────────────────────────────────
+    // Parse visible item labels + quantity numbers rendered in the inventory HUD.
+    // Typical SFL markup: <div class="…inventory-item…"><img alt="Axe"/><span>7</span></div>
+    try {
+      const result = {};
+      const candidates = document.querySelectorAll(
+        "[class*='inventory'] [class*='item'], " +
+        "[class*='inventory'] [class*='slot'], " +
+        "[class*='hud'] [class*='item'], " +
+        "[class*='chest'] [class*='item']"
+      );
+      for (const el of candidates) {
+        // Item name from: alt text, aria-label, title, or inner text (first word)
+        const img  = el.querySelector("img[alt]");
+        const name = (
+          img?.getAttribute("alt") ||
+          el.getAttribute("aria-label") ||
+          el.getAttribute("title") ||
+          ""
+        ).trim();
+        if (!name) continue;
+
+        // Quantity from the first numeric-looking text node / span
+        const qtyEl = Array.from(el.querySelectorAll("span, div, p")).find(function (s) {
+          return /^\d+(\.\d+)?$/.test((s.textContent || "").trim());
+        });
+        const qty = qtyEl ? parseFloat(qtyEl.textContent.trim()) : 1;
+        if (name && qty > 0) {
+          result[name] = (result[name] || 0) + qty;
+        }
+      }
+      if (Object.keys(result).length > 0) {
+        console.warn("[SYSTEM] getInventory: game state unavailable – using DOM scrape. Items found:", Object.keys(result).join(", "));
+        return result;
+      }
+    } catch (_) {}
+
+    // Nothing worked.
+    console.warn("[SYSTEM] getInventory: could not read inventory from game state or DOM.");
+    return {};
   }
 
   /** Returns diamond count (0 if unavailable). */
@@ -2483,6 +2635,9 @@
 
     const inv  = getInventory();
     const have = inv[toolCfg.tool] || 0;
+    log("RESOURCES", "info",
+      `Inventory check – ${toolCfg.tool}: ${have} found` +
+      (Object.keys(inv).length === 0 ? " (inventory unreadable – game state not accessible)" : ""));
     if (have >= 1) return true;
 
     const qty    = randInt(toolCfg.buyMin, toolCfg.buyMax);
