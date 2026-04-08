@@ -1117,11 +1117,23 @@
   }
 
   /**
+   * CSP-safe setTimeout sleep used exclusively inside harvestResource.
+   * The global sleep() uses a Web Worker (blob: URL) that some game CSPs
+   * silently block — making those Promises never resolve and stalling the
+   * hit loop after the first click.  Plain setTimeout is never CSP-blocked.
+   */
+  function _sleepMs(ms) {
+    return new Promise(function (r) { setTimeout(r, ms); });
+  }
+
+  /**
    * Depletes all available resources of `type` with random delays.
    * Detection uses img src patterns (reliable count).
-   * For each img, walks up to find the nearest cursor-pointer ancestor (the
-   * element React's onClick is attached to) and dispatches a click directly
-   * on that element — no elementFromPoint detour that resolves to the wrong target.
+   * For each img:
+   *   1. Walk up to the nearest cursor-pointer ancestor (React onClick target).
+   *   2. Sleep 600–1200 ms before EACH hit (matches mini-snippet timing; lets
+   *      any pending React state / CSS animation settle before the click).
+   *   3. Dispatch a MouseEvent directly on the cursor-pointer ancestor.
    * Click coordinates are reported to Telegram immediately after each depletion.
    * Returns the count of resources fully depleted.
    */
@@ -1131,6 +1143,9 @@
     if (imgs.length === 0) return 0;
 
     log("RESOURCES", "info", `[${type}] Found ${imgs.length} available.`);
+
+    // Noise factor for proportional jitter (matches mini-snippet NOISE_FACTOR).
+    const NOISE = 0.35;
 
     let count = 0;
     for (let i = 0; i < imgs.length; i++) {
@@ -1143,17 +1158,30 @@
       const img = imgs[i];
       // Walk up from the <img> to find the element React's onClick lives on.
       const clickTarget = findClickableAncestor(img);
-      log("RESOURCES", "info", `[${type}] ${i + 1}/${imgs.length} – depleting… (target tag: ${clickTarget.tagName}, classes: ${clickTarget.className})`);
+      log("RESOURCES", "info",
+        `[${type}] ${i + 1}/${imgs.length} – depleting…` +
+        ` (target: <${clickTarget.tagName.toLowerCase()}> "${clickTarget.className.slice(0, 60)}")`);
 
       try {
         const hitCoords = [];
         for (let hit = 0; hit < def.hits; hit++) {
           if (stopped) break;
-          // Re-read the bounding rect of the img each hit so jitter coords
-          // remain valid even if a CSS animation repositions the element.
+
+          // Sleep BEFORE every hit using plain setTimeout (CSP-safe).
+          // 600–1200 ms matches the mini-snippet timing that is confirmed working.
+          const preDelay = randInt(600, 1200);
+          await _sleepMs(preDelay);
+
+          // Re-read the bounding rect of the img each hit.
           const rect = img.getBoundingClientRect();
-          const { x, y } = jitterCoord(rect);
-          // Dispatch click directly on the clickable ancestor.
+          const cx   = rect.left + rect.width  / 2;
+          const cy   = rect.top  + rect.height / 2;
+          const nx   = (Math.random() * 2 - 1) * rect.width  * NOISE;
+          const ny   = (Math.random() * 2 - 1) * rect.height * NOISE;
+          const x    = cx + nx;
+          const y    = cy + ny;
+
+          // Dispatch click directly on the cursor-pointer ancestor.
           clickTarget.dispatchEvent(new MouseEvent("click", {
             bubbles: true, cancelable: true, view: window,
             clientX: x, clientY: y,
@@ -1161,7 +1189,6 @@
             screenY: y + (window.screenY || 0),
           }));
           hitCoords.push(`(${Math.round(x)},${Math.round(y)})`);
-          if (hit < def.hits - 1) await sleep(randInt(200, 500));
         }
         count++;
         const coordStr = hitCoords.join(" → ");
