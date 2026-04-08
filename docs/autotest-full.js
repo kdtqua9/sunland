@@ -1737,50 +1737,98 @@
 
         // ── Plant ─────────────────────────────────────────────────────────
         if (_isCropEmpty(plot)) {
-          const seed     = _chooseSeed();
-          const inv      = getInventory();
-          let   hasSeeds = (inv[seed] || 0) >= 1;
+          const seed = _chooseSeed();
 
-          if (!hasSeeds && CONFIG.crops.buyMissingSeeds) {
-            hasSeeds = await _buySeeds(seed);
-          }
+          // Step 1: Try to select the seed from the basket (equips it to cursor).
+          const beforeSnap    = _snapshotPlot(plot);
+          const foundInBasket = await _selectItemFromBasket(seed);
 
-          if (!hasSeeds && CONFIG.crops.restockIfMissingAndDiamonds) {
-            hasSeeds = await _restockSeeds(seed);
-            if (hasSeeds) hasSeeds = await _buySeeds(seed);
-          }
-
-          if (!hasSeeds) {
-            log("CROPS", "warn", `No ${seed} available – skipping plot.`);
-            continue;
-          }
-
-          // Click plot to open seed selector, then click the seed
-          simulateClick(plot);
-          await randomDelay();
-
-          const seedBtn = _findSeedButton(seed);
-
-          if (seedBtn) {
-            simulateClick(seedBtn);
+          if (foundInBasket) {
+            // Seed was in basket – click the plot to plant.
+            simulateClick(plot);
             await randomDelay();
-            planted++;
-            log("CROPS", "ok", `Planted ${seed}.`);
 
-            // ── Fertilise ─────────────────────────────────────────────────
-            const fertMode = _getFertMode(seed);
-            if (fertMode === "full") {
-              const fertBtn = document.querySelector(
-                "[aria-label*='Fertilise'], [class*='fertilise'], [class*='fertilizer']"
-              );
-              if (fertBtn) {
-                simulateClick(fertBtn);
-                await randomDelay();
-                fertilised++;
-                log("CROPS", "ok", `Fertilised plot (mode: full).`);
+            const afterSnap = _snapshotPlot(plot);
+            if (afterSnap !== beforeSnap) {
+              // Plot changed → successfully planted.
+              planted++;
+              log("CROPS", "ok", `Planted ${seed} (basket-select method).`);
+
+              // ── Fertilise ───────────────────────────────────────────────
+              const fertMode = _getFertMode(seed);
+              if (fertMode === "full") {
+                const fertBtn = document.querySelector(
+                  "[aria-label*='Fertilise'], [class*='fertilise'], [class*='fertilizer']"
+                );
+                if (fertBtn) {
+                  simulateClick(fertBtn);
+                  await randomDelay();
+                  fertilised++;
+                  log("CROPS", "ok", `Fertilised plot (mode: full).`);
+                }
+              }
+            } else {
+              // Plot did not change → seed was not actually in inventory.
+              log("CROPS", "warn", `Plot unchanged after clicking with ${seed} – need to buy more.`);
+              if (CONFIG.crops.buyMissingSeeds) {
+                const bought = await _buySeeds(seed);
+                if (bought) {
+                  // Retry planting after purchase.
+                  await _selectItemFromBasket(seed);
+                  simulateClick(plot);
+                  await randomDelay();
+                  const retrySnap = _snapshotPlot(plot);
+                  if (retrySnap !== beforeSnap) {
+                    planted++;
+                    log("CROPS", "ok", `Planted ${seed} after buying more.`);
+                  } else {
+                    log("CROPS", "warn", `Plot still unchanged after buying ${seed} – skipping.`);
+                  }
+                } else {
+                  log("CROPS", "warn", `Could not buy ${seed} – skipping plot.`);
+                }
               }
             }
-            // "50%" mode is handled passively on the next poll when crop is ~50 % grown
+          } else {
+            // Seed not found in basket – go buy it, then plant.
+            log("CROPS", "info", `${seed} not in basket – attempting to buy from shop.`);
+            let bought = false;
+            if (CONFIG.crops.buyMissingSeeds) {
+              bought = await _buySeeds(seed);
+            }
+            if (!bought && CONFIG.crops.restockIfMissingAndDiamonds) {
+              const restocked = await _restockSeeds(seed);
+              if (restocked) bought = await _buySeeds(seed);
+            }
+            if (!bought) {
+              log("CROPS", "warn", `No ${seed} available – skipping plot.`);
+              continue;
+            }
+
+            // Now select and plant.
+            await _selectItemFromBasket(seed);
+            simulateClick(plot);
+            await randomDelay();
+            const afterSnap = _snapshotPlot(plot);
+            if (afterSnap !== beforeSnap) {
+              planted++;
+              log("CROPS", "ok", `Planted ${seed} (bought + basket-select).`);
+
+              const fertMode = _getFertMode(seed);
+              if (fertMode === "full") {
+                const fertBtn = document.querySelector(
+                  "[aria-label*='Fertilise'], [class*='fertilise'], [class*='fertilizer']"
+                );
+                if (fertBtn) {
+                  simulateClick(fertBtn);
+                  await randomDelay();
+                  fertilised++;
+                  log("CROPS", "ok", `Fertilised plot (mode: full).`);
+                }
+              }
+            } else {
+              log("CROPS", "warn", `Plot still unchanged after buying and selecting ${seed}.`);
+            }
           }
         }
 
@@ -2739,6 +2787,152 @@
   }
 
 
+  // ── Tool-availability helpers (click-first approach) ─────────────────────
+
+  /**
+   * After probing a resource by clicking it, check whether the game rendered
+   * a "no tool" notification / toast.
+   *
+   * SFL shows a red/orange toast like:
+   *   • "Craft 1 Pickaxe"  /  "You need a Pickaxe"
+   *   • "Equip an Axe"
+   * We look for any visible element whose text contains the tool name OR
+   * common SFL error phrases, appearing within 900 ms of the probe click.
+   *
+   * Returns true when a "no tool" signal is detected.
+   */
+  function _detectNoToolNotification(toolName) {
+    const lower = toolName.toLowerCase();
+    // Broad selectors that typically carry toast / alert content in SFL.
+    const candidates = Array.from(document.querySelectorAll(
+      "[class*='toast'], [class*='notification'], [class*='alert'], " +
+      "[class*='snack'], [class*='message'], [class*='error'], " +
+      "[class*='popup'], [class*='modal'] p, [class*='dialog'] p, " +
+      "[role='alert'], [role='status']"
+    ));
+    return candidates.some(function (el) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+      const txt = (el.textContent || "").toLowerCase();
+      return (
+        txt.includes(lower) ||
+        txt.includes("craft") ||
+        txt.includes("equip") ||
+        txt.includes("need") ||
+        txt.includes("missing") ||
+        txt.includes("no tool")
+      );
+    });
+  }
+
+  /**
+   * Check whether a health bar (resource HP indicator) is visible near or
+   * inside the element that was just clicked.
+   *
+   * SFL renders health bars as a small bar with a background-color or a
+   * progress element.  We search the clicked element and its nearby siblings /
+   * ancestors up to 4 levels for any such element.
+   */
+  function _hasHealthBar(el) {
+    // Walk up to the nearest scroll ancestor and search descendants.
+    let root = el;
+    for (let i = 0; i < 4 && root && root !== document.body; i++) {
+      root = root.parentElement;
+    }
+    if (!root) return false;
+    const hpEl = Array.from(root.querySelectorAll(
+      "[class*='health'], [class*='hp'], [class*='progress'], " +
+      "progress, [class*='bar'], [class*='life'], [class*='hitpoint']"
+    )).find(function (e) {
+      const rect = e.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && rect.height < 20; // narrow bar
+    });
+    return !!hpEl;
+  }
+
+  /**
+   * Open the basket, find the item matching `itemName` in the panel, click it
+   * (selecting/equipping it), then close the panel.
+   *
+   * Returns true if the item was found and clicked; false otherwise.
+   * This is used both for seeds (equip before planting) and as a secondary
+   * way to confirm the item is in the inventory.
+   */
+  async function _selectItemFromBasket(itemName) {
+    const btn = _findInventoryButton();
+    if (!btn) {
+      console.warn("[SYSTEM] _selectItemFromBasket: basket button not found.");
+      return false;
+    }
+
+    simulateClick(btn);
+    await _sleepMs(800);
+
+    // Find the item in the open panel.
+    const label  = itemName.toLowerCase();
+    const label2 = itemName.replace(/ Seed$/i, "").toLowerCase();
+
+    const itemEl = Array.from(document.querySelectorAll(
+      "[class*='inventory'] [class*='item'], [class*='inventory'] [class*='slot'], " +
+      "[class*='chest'] [class*='item'], [class*='modal'] [class*='item'], " +
+      "[class*='panel'] [class*='slot'], img[alt]"
+    )).find(function (el) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+      const img  = el.tagName === "IMG" ? el : el.querySelector("img[alt]");
+      const name = (
+        img?.getAttribute("alt") ||
+        el.getAttribute("aria-label") ||
+        el.getAttribute("title") ||
+        el.textContent ||
+        ""
+      ).trim().toLowerCase();
+      return name === label || name.includes(label) || name.includes(label2);
+    });
+
+    if (!itemEl) {
+      log("SYSTEM", "warn", `_selectItemFromBasket: "${itemName}" not found in basket.`);
+      // Close the basket anyway.
+      const closeBtn = document.querySelector(
+        "button[aria-label='Close'], button[aria-label='close'], [class*='close'], [class*='modal-close']"
+      );
+      if (closeBtn && closeBtn.getBoundingClientRect().width > 0) simulateClick(closeBtn);
+      else {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        document.dispatchEvent(new KeyboardEvent("keyup",   { key: "Escape", bubbles: true }));
+      }
+      await _sleepMs(400);
+      return false;
+    }
+
+    simulateClick(itemEl);
+    await _sleepMs(400);
+
+    // Close panel
+    const closeBtn = document.querySelector(
+      "button[aria-label='Close'], button[aria-label='close'], [class*='close'], [class*='modal-close']"
+    );
+    if (closeBtn && closeBtn.getBoundingClientRect().width > 0) {
+      simulateClick(closeBtn);
+    } else {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      document.dispatchEvent(new KeyboardEvent("keyup",   { key: "Escape", bubbles: true }));
+    }
+    await _sleepMs(400);
+    return true;
+  }
+
+  /**
+   * Take a lightweight snapshot of a plot's visual state so we can detect
+   * whether it changed after a planting attempt.
+   * We capture the src attributes of all <img> children.
+   */
+  function _snapshotPlot(plot) {
+    return Array.from(plot.querySelectorAll("img[src]")).map(function (i) {
+      return i.getAttribute("src") || "";
+    }).join("|");
+  }
+
   async function _buyTool(toolName, shopType, qty) {
     log("RESOURCES", "info", `Buying ${qty}× ${toolName} from ${shopType}…`);
 
@@ -2827,36 +3021,48 @@
   }
 
   /**
-   * Check that at least one of the required tool for `type` is in inventory.
-   * If not, attempt to buy a random quantity (buyMin–buyMax from CONFIG).
-   * Sends a Telegram alert and returns false when the purchase fails (e.g.
-   * insufficient coins).  Returns true when the tool is available or when
-   * the tool check is disabled for this type.
+   * CLICK-FIRST tool check for a single resource node.
+   *
+   * Clicks `clickTarget` once (the probe hit), waits for the game to react,
+   * then examines the DOM:
+   *   • If a "no tool" notification is visible → attempt to buy the tool.
+   *   • If a health bar appeared (or no negative signal at all) → tool is present.
+   *
+   * Returns:
+   *   "ok"     – tool present (health bar appeared or no negative signal)
+   *   "bought" – tool was missing but successfully purchased; caller should retry
+   *   "failed" – tool missing and purchase failed
    */
-  async function _ensureTool(type) {
+  async function _probeResourceAndEnsureTool(type, clickTarget, x, y) {
     const toolCfg = CONFIG.resources.tools[type];
-    if (!toolCfg || !toolCfg.enabled) return true;
+    if (!toolCfg || !toolCfg.enabled) return "ok";
 
-    const inv  = getInventory();
-    const have = inv[toolCfg.tool] || 0;
-    log("RESOURCES", "info",
-      `Inventory check – ${toolCfg.tool}: ${have} found` +
-      (Object.keys(inv).length === 0 ? " (inventory unreadable – game state not accessible)" : ""));
-    if (have >= 1) return true;
+    simulateClickAt(x, y);
+    await _sleepMs(700); // wait for game feedback to render
 
-    const qty    = randInt(toolCfg.buyMin, toolCfg.buyMax);
-    const bought = await _buyTool(toolCfg.tool, toolCfg.shop, qty);
-    if (!bought) {
-      const msg =
-        `❌ [${type}] Cannot harvest: no ${toolCfg.tool} in inventory ` +
-        `and purchase from ${toolCfg.shop} failed (not enough coins?).`;
-      log("RESOURCES", "warn", msg);
-      await sendTelegramImmediate(msg);
-      return false;
+    // Health bar appeared → we have the tool, this hit counted.
+    if (_hasHealthBar(clickTarget)) return "ok";
+
+    // No-tool notification → need to buy.
+    if (_detectNoToolNotification(toolCfg.tool)) {
+      log("RESOURCES", "info",
+        `[${type}] No-tool notification detected after probe – attempting buy of ${toolCfg.tool}.`);
+      const qty    = randInt(toolCfg.buyMin, toolCfg.buyMax);
+      const bought = await _buyTool(toolCfg.tool, toolCfg.shop, qty);
+      if (!bought) {
+        const msg =
+          `❌ [${type}] Cannot harvest: no ${toolCfg.tool} – purchase from ${toolCfg.shop} failed.`;
+        log("RESOURCES", "warn", msg);
+        await sendTelegramImmediate(msg);
+        return "failed";
+      }
+      _inventoryCache = { data: {}, ts: 0 };
+      return "bought"; // caller should do real first hit
     }
-    // Invalidate the cache so the next getInventory() call reflects the new tool.
-    _inventoryCache = { data: {}, ts: 0 };
-    return true;
+
+    // No health bar, no notification → ambiguous; treat as ok (tool probably present,
+    // game just didn't render a health bar for this resource type).
+    return "ok";
   }
 
   /**
@@ -2875,14 +3081,11 @@
     const imgs = findAvailableResources(type);
     if (imgs.length === 0) return 0;
 
-    // Ensure the required tool is available before touching any node.
-    const hasTools = await _ensureTool(type);
-    if (!hasTools) {
-      log("RESOURCES", "info", `[${type}] Skipping – no tool available.`);
-      return 0;
-    }
-
     log("RESOURCES", "info", `[${type}] Found ${imgs.length} available.`);
+
+    // Tracks whether we already confirmed the tool is present (after first
+    // successful probe or after a successful buy).
+    let toolConfirmed = false;
 
     let count = 0;
     for (let i = 0; i < imgs.length; i++) {
@@ -2901,6 +3104,8 @@
 
       try {
         const hitCoords = [];
+
+        // ── Hit loop ───────────────────────────────────────────────────────
         for (let hit = 0; hit < def.hits; hit++) {
           if (stopped) break;
 
@@ -2914,33 +3119,43 @@
             }
           }
 
-          // Sleep BEFORE every hit using plain setTimeout (CSP-safe).
-          // Interval is drawn from CONFIG.resources.hitDelayMs.
-          const preDelay = randInt(CONFIG.resources.hitDelayMs.min, CONFIG.resources.hitDelayMs.max);
-          await _sleepMs(preDelay);
+          const preDelay = hit === 0 ? 0 : randInt(CONFIG.resources.hitDelayMs.min, CONFIG.resources.hitDelayMs.max);
+          if (preDelay > 0) await _sleepMs(preDelay);
 
-          // Use the clickTarget's bounding rect for the centre coordinate.
-          // This avoids the large-sprite-sheet problem: stone/iron <img> elements
-          // are often sized as full animation sheets (300-400 px wide), causing
-          // NOISE-based jitter to scatter clicks 100+ px from the visible sprite.
-          // The cursor-pointer ancestor div is sized to the actual game tile.
           const rect = clickTarget.getBoundingClientRect();
           const cx   = rect.left + rect.width  / 2;
           const cy   = rect.top  + rect.height / 2;
-          // Cap jitter at coordNoisePixels (default 8 px) so clicks always land
-          // within the resource tile regardless of how large rect is.
           const cap  = CONFIG.delay.coordNoisePixels;
           const nx   = (Math.random() * 2 - 1) * cap;
           const ny   = (Math.random() * 2 - 1) * cap;
           const x    = cx + nx;
           const y    = cy + ny;
 
-          // Use simulateClickAt which fires the full pointer+mouse event sequence
-          // (pointerdown → mousedown → pointerup → mouseup → click) via
-          // document.elementFromPoint.  A bare MouseEvent("click") does NOT
-          // trigger React's pointerdown handlers that the game relies on.
-          simulateClickAt(x, y);
-          hitCoords.push(`(${Math.round(x)},${Math.round(y)})`);
+          if (hit === 0 && !toolConfirmed) {
+            // ── PROBE HIT: click and check game feedback ───────────────────
+            const probeResult = await _probeResourceAndEnsureTool(type, clickTarget, x, y);
+
+            if (probeResult === "failed") {
+              // No tool and purchase failed – skip the rest of all resources.
+              log("RESOURCES", "info", `[${type}] Skipping – no tool available.`);
+              return count;
+            }
+            if (probeResult === "bought") {
+              // Just bought the tool; the probe click didn't count as a hit.
+              // Do the real first hit now.
+              await _sleepMs(randInt(CONFIG.resources.hitDelayMs.min, CONFIG.resources.hitDelayMs.max));
+              simulateClickAt(x, y);
+              toolConfirmed = true;
+            } else {
+              // "ok" – probe click counted as the first hit.
+              toolConfirmed = true;
+            }
+            hitCoords.push(`(${Math.round(x)},${Math.round(y)})`);
+          } else {
+            // Normal hit after tool is confirmed.
+            simulateClickAt(x, y);
+            hitCoords.push(`(${Math.round(x)},${Math.round(y)})`);
+          }
         }
         count++;
         const coordStr = hitCoords.join(" → ");
