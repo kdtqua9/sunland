@@ -227,6 +227,17 @@
        * The script waits this long before trying to dismiss again.
        */
       timerWaitMs: 8000,
+      /**
+       * When a dialog is still visible after maxDismissAttempts:
+       *   pauseOnBlock   – set the script to paused state (resume via Telegram
+       *                    "start" command or by calling startAutotest()).
+       *   alertOnBlock   – capture a screenshot and send a Telegram alert so
+       *                    you know human intervention is needed.
+       * Both default to true; set false to revert to the old "continue anyway"
+       * behaviour.
+       */
+      pauseOnBlock: true,
+      alertOnBlock: true,
     },
 
     // ── Logging settings ─────────────────────────────────────────────────────
@@ -723,6 +734,9 @@
     "Let's go", "Collect", "Claim", "Continue", "Next",
     "Accept", "Confirm", "OK", "Okay", "Got it", "Acknowledge",
     "Dismiss", "Done", "Skip", "Close",
+    // Shop quantity / purchase confirmation buttons – prevent shop panels
+    // from blocking _dismissDialogs when they remain open after a buy attempt.
+    "Buy 1", "Buy 10", "Buy 5", "Max", "Purchase",
   ];
 
   /**
@@ -878,7 +892,28 @@
 
     if (isGameDialogVisible()) {
       log("SYSTEM", "warn",
-        `Dialog still visible after ${attempts} attempt(s) – continuing anyway.`);
+        `⚠️ Dialog still visible after ${attempts} attempt(s) – automation blocked.`);
+
+      if (CONFIG.dialog.alertOnBlock && CONFIG.logging.telegram.enabled) {
+        const dataUrl = await _captureScreenshot();
+        const caption =
+          `⚠️ <b>Blocked dialog</b> – could not dismiss after ${attempts} attempt(s).\n` +
+          `Round #${_currentRound} · ${_timestamp()}\n` +
+          (CONFIG.dialog.pauseOnBlock
+            ? "Script <b>paused</b>. Send /start to resume after closing the dialog."
+            : "Script continues without dismissing.");
+        if (dataUrl) {
+          await _sendTelegramPhoto(dataUrl, caption);
+        } else {
+          await sendTelegramImmediate(caption);
+        }
+      }
+
+      if (CONFIG.dialog.pauseOnBlock) {
+        log("SYSTEM", "warn",
+          "Script paused – dialog still visible. Close it manually then send /start via Telegram (or call startAutotest()).");
+        paused = true;
+      }
     }
   }
 
@@ -1263,6 +1298,7 @@
     const seedItem = _findShopItem(seedName);
     if (!seedItem) {
       log("CROPS", "warn", `${seedName} not found in shop.`);
+      await _closeShopPanel();
       return false;
     }
 
@@ -1277,8 +1313,10 @@
       simulateClick(confirmBtn);
       await randomDelay();
       log("CROPS", "ok", `Bought ${seedName}.`);
+      await _closeShopPanel();
       return true;
     }
+    await _closeShopPanel();
     return false;
   }
 
@@ -1518,6 +1556,7 @@
     const seedItem = _findShopItem(seedName);
     if (!seedItem) {
       log("FLOWERS", "warn", `${seedName} not found in shop.`);
+      await _closeShopPanel();
       return false;
     }
     simulateClick(seedItem);
@@ -1530,8 +1569,10 @@
       simulateClick(confirmBtn);
       await randomDelay();
       log("FLOWERS", "ok", `Bought ${seedName}.`);
+      await _closeShopPanel();
       return true;
     }
+    await _closeShopPanel();
     return false;
   }
 
@@ -2313,10 +2354,35 @@
   // ── Tool buying helpers ───────────────────────────────────────────────────
 
   /**
-   * Attempt to open `shopType` ("Market" or "Blacksmith"), locate `toolName`
-   * in its inventory, set quantity to `qty`, and confirm the purchase.
-   * Returns true on success, false on any failure.
+   * Close any currently open shop / purchase panel.
+   *
+   * SFL shop panels typically have a close / X button OR can be dismissed with
+   * the Escape key.  This helper tries both strategies so the panel does not
+   * persist as a false-positive `isGameDialogVisible()` hit after a buy.
+   *
+   * Called at the end of every _buySeeds / _buyFlowerSeeds / _buyTool function
+   * regardless of whether the purchase succeeded.
    */
+  async function _closeShopPanel() {
+    // Strategy 1 – click a visible close / X button.
+    const closeSelectors =
+      "button[aria-label='Close'], button[aria-label='close'], " +
+      "[class*='close-btn'], [class*='modal-close'], [class*='dialog-close'], " +
+      "[class*='panel-close'], [class*='shop-close']";
+    const closeBtn = document.querySelector(closeSelectors);
+    if (closeBtn && closeBtn.getBoundingClientRect().width > 0) {
+      simulateClick(closeBtn);
+      await _sleepMs(300);
+      return;
+    }
+
+    // Strategy 2 – dispatch Escape on the document (closes most modal panels).
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    document.dispatchEvent(new KeyboardEvent("keyup",   { key: "Escape", bubbles: true }));
+    await _sleepMs(300);
+  }
+
+
   async function _buyTool(toolName, shopType, qty) {
     log("RESOURCES", "info", `Buying ${qty}× ${toolName} from ${shopType}…`);
 
@@ -2333,6 +2399,7 @@
     const toolItem = _findShopItem(toolName);
     if (!toolItem) {
       log("RESOURCES", "warn", `${toolName} not found in ${shopType} panel.`);
+      await _closeShopPanel();
       return false;
     }
     simulateClick(toolItem);
@@ -2392,11 +2459,14 @@
     );
     if (!confirmBtn) {
       log("RESOURCES", "warn", `Could not find confirm button when buying ${toolName}.`);
+      await _closeShopPanel();
       return false;
     }
     simulateClick(confirmBtn);
     await randomDelay();
     log("RESOURCES", "ok", `Bought ${qty}× ${toolName} from ${shopType}.`);
+    // Close the shop panel so it doesn't trigger isGameDialogVisible() falsely.
+    await _closeShopPanel();
     return true;
   }
 
