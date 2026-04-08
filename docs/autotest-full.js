@@ -1262,20 +1262,244 @@
     } catch (_) { return null; }
   }
 
+  // ── Inventory cache ───────────────────────────────────────────────────────
+  // Populated by _refreshInventoryCache(); valid for up to 60 seconds.
+  let _inventoryCache = { data: {}, ts: 0 };
+  const _INVENTORY_CACHE_TTL_MS = 60_000;
+
   /**
-   * Returns a map of { itemName: quantity } from the current inventory,
-   * or an empty object when unavailable.
+   * Scrape item names + quantities from whatever is currently visible in the
+   * DOM (assumes the inventory panel is already open).
    *
-   * Falls back to DOM scraping when the game state cannot be read via JS.
+   * SFL renders each item as a container with an <img alt="Item Name"> and a
+   * nearby text node / <span> showing the numeric count.  We cast a wide net
+   * of selectors and pick up every visible item we can identify.
+   *
+   * Returns a { name: count } map (may be empty if nothing is found).
    */
-  function getInventory() {
-    // ── Strategy A: game state object ────────────────────────────────────────
+  function _scrapeOpenInventoryPanel() {
+    const result = {};
+    try {
+      // Gather every element that could be an inventory slot/item.
+      // We intentionally use broad selectors so this works across SFL updates.
+      const candidates = Array.from(document.querySelectorAll(
+        "[class*='inventory'] [class*='item'], " +
+        "[class*='inventory'] [class*='slot'], " +
+        "[class*='inventory'] [class*='card'], " +
+        "[class*='chest']     [class*='item'], " +
+        "[class*='chest']     [class*='slot'], " +
+        "[class*='modal']     [class*='item'], " +
+        "[class*='panel']     [class*='item'], " +
+        "[class*='bag']       [class*='item'], " +
+        "[class*='backpack']  [class*='item'], " +
+        // Fallback: any element with an img[alt] that has a sibling number span
+        "img[alt]"
+      ));
+
+      for (const el of candidates) {
+        // For bare <img> hits, use the img itself as the anchor element
+        const anchor = el.tagName === "IMG" ? el.parentElement || el : el;
+        const rect   = anchor.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+
+        // Item name: prefer img alt, then aria-label / title on the container
+        const img  = el.tagName === "IMG" ? el : el.querySelector("img[alt]");
+        const name = (
+          img?.getAttribute("alt") ||
+          anchor.getAttribute("aria-label") ||
+          anchor.getAttribute("title") ||
+          ""
+        ).trim();
+        if (!name || name.length < 2) continue;
+        // Skip decorative / UI images (arrows, icons, etc.)
+        if (/^(left|right|up|down|close|back|forward|arrow|icon|button|bg|background)$/i.test(name)) continue;
+
+        // Quantity: the first visible text node that is purely numeric,
+        // searching the anchor and its immediate children.
+        let qty = 0;
+        const textCandidates = [anchor, ...Array.from(anchor.querySelectorAll("span, p, div, strong, b"))];
+        for (const tc of textCandidates) {
+          // Only look at direct text (childNodes), not deep descendant text
+          for (const node of Array.from(tc.childNodes)) {
+            if (node.nodeType !== Node.TEXT_NODE) continue;
+            const txt = (node.textContent || "").trim();
+            if (/^\d[\d,]*(\.\d+)?$/.test(txt)) {
+              qty = parseFloat(txt.replace(/,/g, ""));
+              break;
+            }
+          }
+          if (qty > 0) break;
+          // Also accept a span whose *only* text content is a number
+          const txt = (tc.textContent || "").trim();
+          if (/^\d[\d,]*(\.\d+)?$/.test(txt)) {
+            qty = parseFloat(txt.replace(/,/g, ""));
+            break;
+          }
+        }
+
+        // If no explicit count found, assume 1 (item is present)
+        if (qty === 0) qty = 1;
+
+        // Accumulate (same item may appear in multiple visible containers)
+        if (!result[name] || qty > result[name]) {
+          result[name] = qty;
+        }
+      }
+    } catch (_) {}
+    return result;
+  }
+
+  /**
+   * Find the inventory basket / backpack button in the HUD.
+   *
+   * SFL renders a pixel-art basket icon at the bottom of the screen.
+   * We try several identification strategies in order.
+   */
+  function _findInventoryButton() {
+    // Strategy 1 – accessible attributes
+    const byAttr = document.querySelector(
+      "[aria-label='Inventory'], [aria-label='inventory'], " +
+      "[title='Inventory'],     [title='inventory'], " +
+      "[aria-label='Basket'],   [aria-label='basket'], " +
+      "[aria-label='Backpack'], [aria-label='backpack']"
+    );
+    if (byAttr && byAttr.getBoundingClientRect().width > 0) return byAttr;
+
+    // Strategy 2 – img src contains inventory-related keyword
+    const invImg = Array.from(document.querySelectorAll("img")).find(function (i) {
+      const src = (i.getAttribute("src") || "").toLowerCase();
+      return (
+        src.includes("basket") ||
+        src.includes("backpack") ||
+        src.includes("inventory") ||
+        src.includes("bag") ||
+        src.includes("satchel")
+      );
+    });
+    if (invImg) {
+      // Walk up to find the clickable ancestor
+      let el = invImg;
+      for (let i = 0; i < 6 && el; i++) {
+        if (
+          el.tagName === "BUTTON" ||
+          el.tagName === "A" ||
+          el.getAttribute("role") === "button" ||
+          el.classList.contains("cursor-pointer")
+        ) return el;
+        el = el.parentElement;
+      }
+      return invImg.parentElement || invImg;
+    }
+
+    // Strategy 3 – text content containing "inventory" / "basket"
+    return Array.from(document.querySelectorAll(
+      "button, [role='button'], [class*='cursor-pointer'], nav *, [class*='hud'] *"
+    )).find(function (el) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+      const t = (
+        el.getAttribute("aria-label") ||
+        el.getAttribute("title") ||
+        el.textContent ||
+        ""
+      ).trim().toLowerCase();
+      return t === "inventory" || t === "basket" || t === "backpack" ||
+             t.includes("inventory") || t.includes("basket");
+    }) || null;
+  }
+
+  /**
+   * Open the inventory basket panel, scrape all item quantities from the DOM,
+   * then close the panel.  Stores the result in _inventoryCache.
+   *
+   * Call this once at the start of any round that needs to check inventory
+   * (crops, resources) so that subsequent synchronous getInventory() calls
+   * return accurate data.
+   *
+   * Safe to call when the game state is already readable – it will use that
+   * fast path and skip the panel open/close entirely.
+   */
+  async function _refreshInventoryCache() {
+    // Fast path: game state is readable – no need to open the UI.
     try {
       const gs = getGameState();
       if (gs) {
         const inv = gs.state?.inventory || gs.inventory || {};
         if (Object.keys(inv).length > 0) {
-          // Decimal.js values – convert to plain numbers
+          const result = {};
+          for (const [k, v] of Object.entries(inv)) {
+            result[k] = typeof v === "object" && v !== null
+              ? (parseFloat(v.toString()) || 0)
+              : (Number(v) || 0);
+          }
+          _inventoryCache = { data: result, ts: Date.now() };
+          return;
+        }
+      }
+    } catch (_) {}
+
+    // Slow path: open the basket, scrape, close.
+    try {
+      const btn = _findInventoryButton();
+      if (!btn) {
+        console.warn("[SYSTEM] _refreshInventoryCache: inventory button not found.");
+        return;
+      }
+
+      simulateClick(btn);
+      // Wait for the panel to render (SFL panels animate in ~300-500 ms)
+      await _sleepMs(800);
+
+      const scraped = _scrapeOpenInventoryPanel();
+
+      // Close the panel: try a close/X button first, then Escape
+      const closeBtn = document.querySelector(
+        "button[aria-label='Close'], button[aria-label='close'], " +
+        "[class*='close'], [class*='modal-close'], [class*='panel-close']"
+      );
+      if (closeBtn && closeBtn.getBoundingClientRect().width > 0) {
+        simulateClick(closeBtn);
+      } else {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        document.dispatchEvent(new KeyboardEvent("keyup",   { key: "Escape", bubbles: true }));
+      }
+      await _sleepMs(400);
+
+      if (Object.keys(scraped).length > 0) {
+        _inventoryCache = { data: scraped, ts: Date.now() };
+        console.info("[SYSTEM] _refreshInventoryCache: cached", Object.keys(scraped).length, "items –", Object.entries(scraped).map(function([k,v]){return k+":"+v;}).join(", "));
+      } else {
+        console.warn("[SYSTEM] _refreshInventoryCache: panel opened but no items scraped.");
+      }
+    } catch (err) {
+      console.warn("[SYSTEM] _refreshInventoryCache error:", err);
+    }
+  }
+
+  /**
+   * Returns a map of { itemName: quantity } from the current inventory.
+   *
+   * Resolution order:
+   *   1. In-memory cache (populated by _refreshInventoryCache, valid 60 s)
+   *   2. Live game state object (fast, works when globals/fiber are accessible)
+   *   3. Live DOM scrape (works only if inventory panel is already open)
+   */
+  function getInventory() {
+    // ── Strategy 1: fresh cache ───────────────────────────────────────────────
+    if (
+      _inventoryCache.ts > 0 &&
+      Date.now() - _inventoryCache.ts < _INVENTORY_CACHE_TTL_MS &&
+      Object.keys(_inventoryCache.data).length > 0
+    ) {
+      return _inventoryCache.data;
+    }
+
+    // ── Strategy 2: live game state ───────────────────────────────────────────
+    try {
+      const gs = getGameState();
+      if (gs) {
+        const inv = gs.state?.inventory || gs.inventory || {};
+        if (Object.keys(inv).length > 0) {
           const result = {};
           for (const [k, v] of Object.entries(inv)) {
             result[k] = typeof v === "object" && v !== null
@@ -1287,40 +1511,12 @@
       }
     } catch (_) {}
 
-    // ── Strategy B: DOM scrape ────────────────────────────────────────────────
-    // Parse visible item labels + quantity numbers rendered in the inventory HUD.
-    // Typical SFL markup: <div class="…inventory-item…"><img alt="Axe"/><span>7</span></div>
+    // ── Strategy 3: live DOM scrape (panel must already be open) ─────────────
     try {
-      const result = {};
-      const candidates = document.querySelectorAll(
-        "[class*='inventory'] [class*='item'], " +
-        "[class*='inventory'] [class*='slot'], " +
-        "[class*='hud'] [class*='item'], " +
-        "[class*='chest'] [class*='item']"
-      );
-      for (const el of candidates) {
-        // Item name from: alt text, aria-label, title, or inner text (first word)
-        const img  = el.querySelector("img[alt]");
-        const name = (
-          img?.getAttribute("alt") ||
-          el.getAttribute("aria-label") ||
-          el.getAttribute("title") ||
-          ""
-        ).trim();
-        if (!name) continue;
-
-        // Quantity from the first numeric-looking text node / span
-        const qtyEl = Array.from(el.querySelectorAll("span, div, p")).find(function (s) {
-          return /^\d+(\.\d+)?$/.test((s.textContent || "").trim());
-        });
-        const qty = qtyEl ? parseFloat(qtyEl.textContent.trim()) : 1;
-        if (name && qty > 0) {
-          result[name] = (result[name] || 0) + qty;
-        }
-      }
-      if (Object.keys(result).length > 0) {
-        console.warn("[SYSTEM] getInventory: game state unavailable – using DOM scrape. Items found:", Object.keys(result).join(", "));
-        return result;
+      const scraped = _scrapeOpenInventoryPanel();
+      if (Object.keys(scraped).length > 0) {
+        console.warn("[SYSTEM] getInventory: using live DOM scrape. Items:", Object.keys(scraped).join(", "));
+        return scraped;
       }
     } catch (_) {}
 
@@ -1466,6 +1662,7 @@
       await randomDelay();
       log("CROPS", "ok", `Bought ${seedName}.`);
       await _closeShopPanel();
+      _inventoryCache = { data: {}, ts: 0 }; // invalidate so next check re-reads
       return true;
     }
     await _closeShopPanel();
@@ -1513,6 +1710,10 @@
       log("CROPS", "info", "No crop plots found on this page.");
       return;
     }
+
+    // Refresh the inventory cache once so all per-plot seed checks below
+    // see the real counts rather than an empty object.
+    await _refreshInventoryCache();
 
     let harvested = 0, planted = 0, fertilised = 0;
 
@@ -1722,6 +1923,7 @@
       await randomDelay();
       log("FLOWERS", "ok", `Bought ${seedName}.`);
       await _closeShopPanel();
+      _inventoryCache = { data: {}, ts: 0 }; // invalidate so next check re-reads
       return true;
     }
     await _closeShopPanel();
@@ -1740,6 +1942,8 @@
       log("FLOWERS", "info", "No flower beds found on this page.");
       return;
     }
+
+    await _refreshInventoryCache();
 
     let harvested = 0, planted = 0;
 
@@ -2650,6 +2854,8 @@
       await sendTelegramImmediate(msg);
       return false;
     }
+    // Invalidate the cache so the next getInventory() call reflects the new tool.
+    _inventoryCache = { data: {}, ts: 0 };
     return true;
   }
 
@@ -2757,6 +2963,10 @@
     }
 
     log("RESOURCES", "info", "Starting resources round…");
+
+    // Refresh the inventory cache once so all _ensureTool checks below
+    // see the real tool counts rather than an empty object.
+    await _refreshInventoryCache();
 
     const featureFlags = CONFIG.features.resources;
 
