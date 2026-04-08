@@ -1101,10 +1101,7 @@
    */
   async function _buySeeds(seedName) {
     log("CROPS", "info", `Attempting to buy ${seedName} from shop…`);
-    // Look for a shop / market button in the HUD
-    const shopBtn = document.querySelector(
-      "[aria-label*='Shop'], [aria-label*='Market'], [class*='shop'], [class*='market']"
-    );
+    const shopBtn = _findShopButton("Market");
     if (!shopBtn) {
       log("CROPS", "warn", "Could not find shop button to buy seeds.");
       return false;
@@ -1112,10 +1109,7 @@
     simulateClick(shopBtn);
     await randomDelay();
 
-    // Within the opened shop, look for the seed
-    const seedItem = Array.from(document.querySelectorAll("[class*='shop'] *"))
-      .find(el => el.textContent && el.textContent.includes(seedName));
-
+    const seedItem = _findShopItem(seedName);
     if (!seedItem) {
       log("CROPS", "warn", `${seedName} not found in shop.`);
       return false;
@@ -1126,7 +1120,7 @@
 
     // Confirm buy
     const confirmBtn = document.querySelector(
-      "button[class*='confirm'], button[class*='buy'], [aria-label*='Confirm']"
+      "button[class*='confirm'], button[class*='buy'], [aria-label*='Confirm'], [aria-label*='Buy']"
     );
     if (confirmBtn) {
       simulateClick(confirmBtn);
@@ -1182,6 +1176,10 @@
     let harvested = 0, planted = 0, fertilised = 0;
 
     for (const plot of plots) {
+      if (stopped) return;
+
+      // Dismiss any popup that appeared between or before this click.
+      if (isGameDialogVisible()) await _dismissDialogs();
       if (stopped) return;
 
       try {
@@ -1358,9 +1356,7 @@
 
   async function _buyFlowerSeeds(seedName) {
     log("FLOWERS", "info", `Attempting to buy ${seedName} from shop…`);
-    const shopBtn = document.querySelector(
-      "[aria-label*='Shop'], [aria-label*='Market'], [class*='shop'], [class*='market']"
-    );
+    const shopBtn = _findShopButton("Market");
     if (!shopBtn) {
       log("FLOWERS", "warn", "Could not find shop button.");
       return false;
@@ -1368,9 +1364,7 @@
     simulateClick(shopBtn);
     await randomDelay();
 
-    const seedItem = Array.from(document.querySelectorAll("[class*='shop'] *"))
-      .find(el => el.textContent && el.textContent.includes(seedName));
-
+    const seedItem = _findShopItem(seedName);
     if (!seedItem) {
       log("FLOWERS", "warn", `${seedName} not found in shop.`);
       return false;
@@ -1379,7 +1373,7 @@
     await randomDelay();
 
     const confirmBtn = document.querySelector(
-      "button[class*='confirm'], button[class*='buy'], [aria-label*='Confirm']"
+      "button[class*='confirm'], button[class*='buy'], [aria-label*='Confirm'], [aria-label*='Buy']"
     );
     if (confirmBtn) {
       simulateClick(confirmBtn);
@@ -1406,6 +1400,10 @@
     let harvested = 0, planted = 0;
 
     for (const bed of beds) {
+      if (stopped) return;
+
+      // Dismiss any popup that appeared between or before this click.
+      if (isGameDialogVisible()) await _dismissDialogs();
       if (stopped) return;
 
       try {
@@ -1599,6 +1597,87 @@
     return new Promise(function (r) { setTimeout(r, ms); });
   }
 
+  // ── Shop navigation helpers ───────────────────────────────────────────────
+
+  /**
+   * Find the HUD / map button that opens `shopType` ("Market", "Blacksmith",
+   * "Shop", etc.).  Three strategies are tried in order:
+   *
+   * 1. aria-label or title attribute containing the keyword (fast, exact).
+   * 2. Text-content scan of every visible clickable element.
+   * 3. Walk up from the first <img> whose src path contains the keyword –
+   *    most SFL HUD icons are rendered as PNG/WebP sprites without labels.
+   *
+   * Returns the clickable element, or null when nothing is found.
+   */
+  function _findShopButton(shopType) {
+    const kw = shopType.toLowerCase();
+
+    // Strategy 1 – attribute matching
+    const byAttr = document.querySelector(
+      `[aria-label*='${shopType}'], [title*='${shopType}'], ` +
+      `[aria-label*='${kw}'],     [title*='${kw}']`
+    );
+    if (byAttr) return byAttr;
+
+    // Strategy 2 – text content scan (covers labelled nav items)
+    const byText = Array.from(document.querySelectorAll(
+      "button, [role='button'], a, [class*='cursor-pointer'], nav *, [class*='hud'] *"
+    )).find(function (el) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+      const t = (
+        el.textContent             ||
+        el.getAttribute("aria-label") ||
+        el.getAttribute("title")   ||
+        ""
+      ).trim().toLowerCase();
+      return t === kw || t.includes(kw);
+    });
+    if (byText) return byText;
+
+    // Strategy 3 – img src pattern (SFL renders buildings as sprite images)
+    const img = Array.from(document.querySelectorAll("img")).find(function (i) {
+      const src = (i.src || "").toLowerCase();
+      return src.includes(kw);
+    });
+    if (img) {
+      let el = img;
+      for (let i = 0; i < 6 && el; i++) {
+        if (
+          el.tagName === "BUTTON" ||
+          el.tagName === "A"      ||
+          el.getAttribute("role") === "button" ||
+          el.classList.contains("cursor-pointer")
+        ) return el;
+        el = el.parentElement;
+      }
+      return img.parentElement || null;
+    }
+
+    return null;
+  }
+
+  /**
+   * After a shop panel has been opened (via simulateClick on shopBtn),
+   * find the item entry whose text includes `itemName`.
+   * Searches all visible elements – not limited to a specific class subtree –
+   * because SFL's shop panel class names don't reliably contain "shop".
+   */
+  function _findShopItem(itemName) {
+    const label  = itemName.toLowerCase();
+    const label2 = itemName.replace(/ Seed$/i, "").toLowerCase(); // e.g. "Sunflower"
+    return Array.from(document.querySelectorAll(
+      "button, [role='button'], [class*='item'], [class*='slot'], [class*='card'], " +
+      "[class*='entry'], [class*='row'], li, td, [class*='product']"
+    )).find(function (el) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+      const t = (el.textContent || "").trim().toLowerCase();
+      return t.includes(label) || t.includes(label2);
+    }) || null;
+  }
+
   // ── Tool buying helpers ───────────────────────────────────────────────────
 
   /**
@@ -1610,10 +1689,7 @@
     log("RESOURCES", "info", `Buying ${qty}× ${toolName} from ${shopType}…`);
 
     // Try to open the correct shop panel.
-    const shopSelector = shopType === "Blacksmith"
-      ? "[aria-label*='Blacksmith'], [class*='blacksmith'], [data-tab*='blacksmith']"
-      : "[aria-label*='Shop'], [aria-label*='Market'], [class*='shop'], [class*='market']";
-    const shopBtn = document.querySelector(shopSelector);
+    const shopBtn = _findShopButton(shopType);
     if (!shopBtn) {
       log("RESOURCES", "warn", `Cannot find ${shopType} button in the HUD.`);
       return false;
@@ -1622,11 +1698,7 @@
     await randomDelay();
 
     // Find the tool item inside the shop panel.
-    const toolItem = Array.from(document.querySelectorAll("button, [role='button'], [class*='item']"))
-      .find(function (el) {
-        const t = (el.textContent || "").trim();
-        return t === toolName || t.includes(toolName);
-      });
+    const toolItem = _findShopItem(toolName);
     if (!toolItem) {
       log("RESOURCES", "warn", `${toolName} not found in ${shopType} panel.`);
       return false;
@@ -1923,9 +1995,18 @@
       if (stopped) break;
 
       // ── Run enabled modules ──────────────────────────────────────────────
-      if (!stopped && !paused && CONFIG.features.crops)     await runCropsRound();
-      if (!stopped && !paused && CONFIG.features.flowers)   await runFlowersRound();
-      if (!stopped && !paused)                               await runResourcesRound(round);
+      if (!stopped && !paused && CONFIG.features.crops) {
+        await _dismissDialogs();
+        await runCropsRound();
+      }
+      if (!stopped && !paused && CONFIG.features.flowers) {
+        await _dismissDialogs();
+        await runFlowersRound();
+      }
+      if (!stopped && !paused) {
+        await _dismissDialogs();
+        await runResourcesRound(round);
+      }
 
       // ── Error budget check ───────────────────────────────────────────────
       _checkErrorBudget();
