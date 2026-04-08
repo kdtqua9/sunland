@@ -31,6 +31,7 @@
     features: {
       crops: true,
       flowers: true,
+      fruits: true,
       resources: {
         trees: true,
         stone: true,
@@ -102,6 +103,27 @@
       buyMissingSeeds: true,
       /** Log a warning (+ optional Telegram alert) when unable to plant */
       notifyIfCantPlant: true,
+    },
+
+    // ── Fruit settings ──────────────────────────────────────────────────────
+    fruits: {
+      /**
+       * Which fruit tree / bush types to manage.
+       * Each name is matched against img src paths (case-insensitive).
+       * Common SFL fruits: "Apple", "Orange", "Blueberry", "Banana",
+       *   "Lemon", "Tomato", "Eggplant", "Corn", "Radish", "Wheat", "Kale"
+       * (Keep only the types your farm actually has.)
+       */
+      types: ["Apple", "Orange", "Blueberry", "Banana"],
+      /** Apply fertiliser to fruit patches when planting */
+      useFertiliser: true,
+      /**
+       * "full"  – fertilise immediately after planting
+       * "none"  – never fertilise
+       */
+      fertiliserMode: "full",
+      /** Try to buy fruit seeds / saplings from the shop when the slot is empty */
+      buyMissingSeeds: false,
     },
 
     // ── Resource settings ────────────────────────────────────────────────────
@@ -1539,6 +1561,177 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // ─── FEATURE MODULE: FRUITS ───────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Build the list of img-src substrings to match for each configured fruit
+   * type.  E.g. "Apple" → "/fruit/apple", "/fruits/apple".
+   * Both singular (/fruit/) and plural (/fruits/) paths are tried.
+   */
+  function _fruitPatterns() {
+    return (CONFIG.fruits.types || []).flatMap(function (name) {
+      const lc = name.toLowerCase();
+      return ["/fruit/" + lc, "/fruits/" + lc];
+    });
+  }
+
+  /**
+   * Returns all visible fruit tree / bush elements that are currently on the
+   * page.  Each entry is the clickable ancestor of the matching <img>.
+   */
+  function _findFruitTrees() {
+    const patterns = _fruitPatterns();
+    if (patterns.length === 0) return [];
+
+    const imgs = Array.from(document.querySelectorAll("img[src]")).filter(function (img) {
+      const src = (img.src || "").toLowerCase();
+      if (!patterns.some(function (p) { return src.includes(p); })) return false;
+      const rect = img.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+
+    // Walk up to the clickable ancestor (React onClick target).
+    return imgs.map(function (img) {
+      let el = img.parentElement;
+      for (let i = 0; i < 6 && el; i++) {
+        if (
+          el.getAttribute("role") === "button" ||
+          el.classList.contains("cursor-pointer")
+        ) return el;
+        el = el.parentElement;
+      }
+      return img.parentElement || img;
+    }).filter(Boolean);
+  }
+
+  /** True when the fruit image suggests it is ready to harvest. */
+  function _isFruitReady(el) {
+    const img = el.querySelector ? el.querySelector("img[src]") : el;
+    if (!img) return false;
+    const src = (img.src || "").toLowerCase();
+    return (
+      src.includes("ready")   ||
+      src.includes("harvest") ||
+      src.includes("ripe")    ||
+      src.includes("full")
+    );
+  }
+
+  /** True when the fruit slot appears to be empty / waiting for a seed. */
+  function _isFruitEmpty(el) {
+    const img = el.querySelector ? el.querySelector("img[src]") : el;
+    if (!img) return true;
+    const src = (img.src || "").toLowerCase();
+    return (
+      src.includes("empty") ||
+      src.includes("soil")  ||
+      src.includes("bare")  ||
+      // If none of the known fruit patterns are in the src, assume empty
+      !_fruitPatterns().some(function (p) { return src.includes(p); })
+    );
+  }
+
+  /**
+   * Attempt to plant a fruit seed in an empty slot.
+   * Strategy: click the slot, then look for a seed/plant button matching
+   * one of the configured fruit type names.
+   * Returns true when a seed button was found and clicked.
+   */
+  async function _plantFruit(slotEl) {
+    simulateClick(slotEl);
+    await randomDelay();
+
+    const types = CONFIG.fruits.types || [];
+    for (const typeName of types) {
+      const lc = typeName.toLowerCase();
+      const btn = Array.from(document.querySelectorAll(
+        "button, [role='button'], [class*='seed'], [class*='plant'], [class*='sapling']"
+      )).find(function (el) {
+        const t = (el.textContent || el.getAttribute("aria-label") || "").toLowerCase();
+        return t.includes(lc);
+      });
+      if (btn && btn.getBoundingClientRect().width > 0) {
+        simulateClick(btn);
+        await randomDelay();
+        return typeName;
+      }
+    }
+    return null; // no seed button found
+  }
+
+  /**
+   * Harvest all ready fruit, then plant empty slots according to CONFIG.fruits.
+   * Applies fertiliser immediately after planting when useFertiliser is true
+   * and fertiliserMode is "full".
+   */
+  async function runFruitsRound() {
+    if (isCaptchaVisible()) {
+      log("FRUITS", "warn", "Captcha detected – skipping fruits round.");
+      return;
+    }
+
+    const trees = _findFruitTrees();
+    if (trees.length === 0) {
+      log("FRUITS", "info", "No fruit trees / bushes found on this page.");
+      return;
+    }
+
+    log("FRUITS", "info", `Starting fruits round – found ${trees.length} slot(s).`);
+
+    let harvested = 0, planted = 0, fertilised = 0;
+
+    for (const tree of trees) {
+      if (stopped) return;
+
+      if (isGameDialogVisible()) await _dismissDialogs();
+      if (stopped) return;
+
+      try {
+        // ── Harvest ──────────────────────────────────────────────────────────
+        if (_isFruitReady(tree)) {
+          simulateClick(tree);
+          await randomDelay();
+          harvested++;
+          log("FRUITS", "ok", "Harvested a fruit.");
+        }
+
+        if (stopped) return;
+
+        // ── Plant ────────────────────────────────────────────────────────────
+        if (_isFruitEmpty(tree)) {
+          const plantedType = await _plantFruit(tree);
+          if (plantedType) {
+            planted++;
+            log("FRUITS", "ok", `Planted ${plantedType}.`);
+
+            // ── Fertilise ────────────────────────────────────────────────────
+            if (CONFIG.fruits.useFertiliser && CONFIG.fruits.fertiliserMode === "full") {
+              const fertBtn = document.querySelector(
+                "[aria-label*='Fertilise'], [aria-label*='fertilise'], " +
+                "[class*='fertilise'], [class*='fertilizer']"
+              );
+              if (fertBtn && fertBtn.getBoundingClientRect().width > 0) {
+                simulateClick(fertBtn);
+                await randomDelay();
+                fertilised++;
+                log("FRUITS", "ok", `Fertilised fruit slot (${plantedType}).`);
+              }
+            }
+          } else {
+            log("FRUITS", "info", "Empty fruit slot – no matching seed button found.");
+          }
+        }
+      } catch (err) {
+        recordError("FRUITS", `Fruit action failed: ${err.message || err}`);
+      }
+    }
+
+    log("FRUITS", "info",
+      `Round done – harvested: ${harvested}, planted: ${planted}, fertilised: ${fertilised}.`);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // ─── FEATURE MODULE: RESOURCES ────────────────────────────────────────────
   // ══════════════════════════════════════════════════════════════════════════
 
@@ -1983,7 +2176,15 @@
 
     const featureFlags = CONFIG.features.resources;
 
-    for (const type of Object.keys(RESOURCE_DEFS)) {
+    // Shuffle resource types each round so the processing order is
+    // unpredictable (anti-bot: avoids fixed deterministic click patterns).
+    const _shuffledTypes = Object.keys(RESOURCE_DEFS).slice();
+    for (let i = _shuffledTypes.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = _shuffledTypes[i]; _shuffledTypes[i] = _shuffledTypes[j]; _shuffledTypes[j] = tmp;
+    }
+
+    for (const type of _shuffledTypes) {
       if (stopped) return;
       if (!featureFlags[type]) continue;
       try {
@@ -2012,6 +2213,10 @@
       const ready = _findFlowerBeds().filter(_isFlowerReady).length;
       lines.push(`  Flowers ready: ${ready}`);
     }
+    if (CONFIG.features.fruits) {
+      const ready = _findFruitTrees().filter(_isFruitReady).length;
+      lines.push(`  Fruits ready:  ${ready}`);
+    }
     for (const type of Object.keys(RESOURCE_DEFS)) {
       if (CONFIG.features.resources[type]) {
         lines.push(`  ${type.padEnd(10)} ready: ${findAvailableResources(type).length}`);
@@ -2031,6 +2236,160 @@
     if (_tgFlushTimer) { _nativeClearTimeout(_tgFlushTimer); _tgFlushTimer = null; }
     try { _worker.terminate(); }       catch (_) {}
     try { URL.revokeObjectURL(_workerUrl); } catch (_) {}
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ─── Crash guard (Aw Snap / error code 9 = OOM) ──────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Check Chrome's (non-standard) performance.memory API.
+   * If the used JS heap exceeds 90 % of the total limit, the tab is at severe
+   * risk of running out of memory and triggering the "Aw, Snap!" crash
+   * (error code 9 = STATUS_INSUFFICIENT_RESOURCES).
+   *
+   * When pressure is detected:
+   *  1. Log + send a Telegram warning with a screenshot.
+   *  2. Hard-stop the autotest so the tab can GC and recover.
+   *
+   * Safe to call in any browser – the check is a no-op when the API is absent.
+   */
+  async function _checkMemoryPressure() {
+    const mem = window.performance && window.performance.memory;
+    if (!mem) return; // API not available (non-Chrome or flag disabled)
+
+    const pct = mem.usedJSHeapSize / mem.jsHeapSizeLimit;
+    if (pct < 0.85) return; // healthy
+
+    const mb      = (n) => (n / 1_048_576).toFixed(1);
+    const message =
+      `🚨 Memory pressure detected – heap at ${(pct * 100).toFixed(1)}%
+` +
+      `Used: ${mb(mem.usedJSHeapSize)} MB / ${mb(mem.jsHeapSizeLimit)} MB
+` +
+      "Stopping autotest to prevent Aw-Snap crash (error code 9).";
+
+    log("SYSTEM", "error", message);
+
+    // Capture screenshot and send to Telegram before stopping.
+    const shot = await _captureScreenshot().catch(() => null);
+    if (shot) {
+      await _sendTelegramPhoto(shot, message);
+    } else if (CONFIG.logging.telegram.enabled) {
+      await sendTelegramImmediate(message);
+    }
+
+    await _reportAndStop("memory pressure (heap ≥85 %)");
+  }
+
+  /**
+   * Register a beforeunload listener that fires when the page is about to be
+   * unloaded (navigation, tab close, or right before an Aw-Snap crash).
+   * Sends a best-effort screenshot + alert to Telegram.
+   * This runs synchronously in the event handler then schedules async work.
+   */
+  (function _registerCrashGuard() {
+    window.addEventListener("beforeunload", function () {
+      if (stopped) return; // already stopped cleanly
+      // We can't await here (synchronous event), so fire-and-forget.
+      const caption = "⚠️ Sunland autotest: page unloading unexpectedly – possible Aw-Snap crash.";
+      _captureScreenshot().then(function (shot) {
+        if (shot) return _sendTelegramPhoto(shot, caption);
+        return sendTelegramImmediate(caption);
+      }).catch(function () {});
+    });
+
+    // Also catch unhandled JS errors and Promise rejections that could be
+    // precursors to the crash (e.g. React root unmount errors).
+    window.addEventListener("error", function (e) {
+      if (stopped) return;
+      const msg = `🚨 Uncaught JS error: ${e.message || e} (${e.filename}:${e.lineno})`;
+      log("SYSTEM", "error", msg);
+      if (CONFIG.logging.telegram.enabled) sendTelegramImmediate(msg).catch(function () {});
+    });
+
+    window.addEventListener("unhandledrejection", function (e) {
+      if (stopped) return;
+      const reason = (e.reason && (e.reason.message || String(e.reason))) || "unknown";
+      const msg = `🚨 Unhandled Promise rejection: ${reason}`;
+      log("SYSTEM", "error", msg);
+      if (CONFIG.logging.telegram.enabled) sendTelegramImmediate(msg).catch(function () {});
+    });
+  })();
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ─── Anti-bot / human-like behaviour ─────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Dispatch a short burst of realistic mousemove events along a smooth
+   * Bézier-like curve from the current mouse position toward a random target
+   * on screen.  Fires 6–12 events with 30–80 ms gaps – similar to a human
+   * casually moving the cursor between clicks.
+   *
+   * The last known pointer position is tracked in _lastPointerX / _lastPointerY.
+   */
+  let _lastPointerX = window.innerWidth  / 2;
+  let _lastPointerY = window.innerHeight / 2;
+
+  async function _humanMouseDrift() {
+    const targetX = randInt(50, window.innerWidth  - 50);
+    const targetY = randInt(50, window.innerHeight - 50);
+    const steps   = randInt(6, 12);
+
+    for (let i = 1; i <= steps; i++) {
+      const t  = i / steps;
+      // Quadratic easing so the movement accelerates then decelerates.
+      const et = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+      const x  = _lastPointerX + (_lastPointerX - targetX) * -et;
+      const y  = _lastPointerY + (_lastPointerY - targetY) * -et;
+
+      document.dispatchEvent(new MouseEvent("mousemove", {
+        bubbles: true, cancelable: false,
+        clientX: Math.round(x), clientY: Math.round(y),
+        screenX: Math.round(x + (window.screenX || 0)),
+        screenY: Math.round(y + (window.screenY || 0)),
+        movementX: Math.round(x - _lastPointerX),
+        movementY: Math.round(y - _lastPointerY),
+      }));
+
+      _lastPointerX = x;
+      _lastPointerY = y;
+      await _sleepMs(randInt(30, 80));
+    }
+  }
+
+  /**
+   * Scroll the page by a small random delta (±20–80 px vertically, rarely
+   * horizontal) to mimic a user casually scanning the farm.
+   */
+  async function _humanScroll() {
+    const dy = (Math.random() > 0.5 ? 1 : -1) * randInt(20, 80);
+    const dx = Math.random() > 0.85 ? (Math.random() > 0.5 ? 1 : -1) * randInt(5, 20) : 0;
+    window.scrollBy({ left: dx, top: dy, behavior: "smooth" });
+    await _sleepMs(randInt(300, 700));
+    // Scroll back so we don't drift off the farm view.
+    window.scrollBy({ left: -dx, top: -dy, behavior: "smooth" });
+    await _sleepMs(randInt(200, 500));
+  }
+
+  /**
+   * Occasionally insert a longer human-like idle pause (5–20 s) with mouse
+   * drift and micro-scrolls to break the mechanical round rhythm.
+   * Only fires ~12 % of the time so rounds don't drag.
+   */
+  async function _humanIdle() {
+    if (Math.random() > 0.12) return; // skip most of the time
+
+    const idleMs = randInt(5_000, 20_000);
+    log("SYSTEM", "info", `[anti-bot] Taking a ${(idleMs / 1000).toFixed(1)} s human idle pause…`);
+
+    const end = Date.now() + idleMs;
+    while (Date.now() < end && !stopped) {
+      await _humanMouseDrift();
+      if (Math.random() > 0.6) await _humanScroll();
+      await _sleepMs(randInt(800, 2500));
+    }
   }
 
   window.stopAutotest = async function () {
@@ -2066,6 +2425,7 @@
       "   Enabled features:\n" +
       `     crops:     ${CONFIG.features.crops}\n` +
       `     flowers:   ${CONFIG.features.flowers}\n` +
+      `     fruits:    ${CONFIG.features.fruits}\n` +
       `     resources: ${JSON.stringify(CONFIG.features.resources)}\n` +
       "   Run  stopAutotest()  to stop at any time."
     );
@@ -2074,7 +2434,7 @@
     if (CONFIG.logging.telegram.enabled) {
       sendTelegramImmediate(
         "🌻 Sunflower Land Autotest started.\n" +
-        `Features: crops=${CONFIG.features.crops} flowers=${CONFIG.features.flowers}\n` +
+        `Features: crops=${CONFIG.features.crops} flowers=${CONFIG.features.flowers} fruits=${CONFIG.features.fruits}\n` +
         `Resources: ${Object.entries(CONFIG.features.resources).filter(([,v])=>v).map(([k])=>k).join(", ")}\n` +
         (CONFIG.logging.telegram.listenForCommands
           ? "Commands: send 'stop' to pause · 'start' to resume"
@@ -2109,19 +2469,37 @@
       await _dismissDialogs();
       if (stopped) break;
 
+      // ── Memory pressure check (crash guard) ─────────────────────────────
+      await _checkMemoryPressure();
+      if (stopped) break;
+
+      // ── Human idle pause (anti-bot rhythm break) ─────────────────────────
+      await _humanIdle();
+      if (stopped) break;
+
       // ── Run enabled modules ──────────────────────────────────────────────
       if (!stopped && !paused && CONFIG.features.crops) {
         await _dismissDialogs();
         await runCropsRound();
+        await _humanMouseDrift();
       }
       if (!stopped && !paused && CONFIG.features.flowers) {
         await _dismissDialogs();
         await runFlowersRound();
+        await _humanMouseDrift();
+      }
+      if (!stopped && !paused && CONFIG.features.fruits) {
+        await _dismissDialogs();
+        await runFruitsRound();
+        await _humanMouseDrift();
       }
       if (!stopped && !paused) {
         await _dismissDialogs();
         await runResourcesRound(round);
       }
+
+      // ── Memory pressure check after heavy round ──────────────────────────
+      await _checkMemoryPressure();
 
       // ── Error budget check ───────────────────────────────────────────────
       _checkErrorBudget();
