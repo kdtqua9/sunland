@@ -136,6 +136,28 @@
       },
     },
 
+    // ── Dialog / popup settings ──────────────────────────────────────────────
+    dialog: {
+      /**
+       * Automatically detect and click through any game popup that appears
+       * before or during a round (goblin swarm, event dialogs, reward screens,
+       * season notifications, etc.).
+       * The script clicks "Next / Continue / Accept / OK / Close" buttons in
+       * sequence until the dialog disappears or the attempt limit is reached.
+       */
+      handleDialogs: true,
+      /** Maximum dismiss-button clicks per pass before giving up. */
+      maxDismissAttempts: 15,
+      /** Random delay (ms) between each dismiss click. */
+      dismissDelayMs: { min: 600, max: 1200 },
+      /**
+       * Extra wait (ms) applied when a countdown timer is detected inside
+       * the dialog (e.g. a goblin-swarm "wait X minutes" screen).
+       * The script waits this long before trying to dismiss again.
+       */
+      timerWaitMs: 8000,
+    },
+
     // ── Logging settings ─────────────────────────────────────────────────────
     logging: {
       /** Print structured lines to the browser console */
@@ -170,6 +192,20 @@
          * log line is printed.  Default: 30 s.
          */
         commandPollIntervalSec: 30,
+        /**
+         * Send one formatted round-summary message to Telegram at the end of
+         * each round, grouping all actions / results / warnings by category.
+         * Set false to disable Telegram messages from the automation entirely
+         * (only startup/stop system messages will be sent).
+         */
+        summaryPerRound: true,
+        /**
+         * Capture a JPEG screenshot of the farm page and attach it to the
+         * round summary message.  Uses html2canvas, which is loaded
+         * automatically from CDN on first use.
+         * Set to false if CDN access is blocked or you prefer text-only.
+         */
+        sendScreenshot: false,
       },
       /**
        * IANA timezone for log timestamps.
@@ -208,6 +244,7 @@
   // ─── Stop / pause control ─────────────────────────────────────────────────
   let stopped = false;  // hard stop (console stopAutotest())
   let paused  = false;  // soft pause via Telegram "stop" command; "start" resumes
+  let _currentRound = 0; // updated each iteration – used by stopAutotest summary
 
   // ─── Web Worker for background-safe sleep ─────────────────────────────────
   const _workerCode = `
@@ -327,6 +364,9 @@
   let   _tgFlushTimer   = null;
   // Tracks the next update_id offset for getUpdates polling (stop-command listener).
   let   _tgUpdateOffset = 0;
+  // Per-round structured events – cleared at the start of each round and
+  // formatted into a single Telegram summary message at the end.
+  const _roundEvents    = [];
 
   /** Return current time as HH:MM:SS in the configured timezone (default UTC+7) */
   function _timestamp() {
@@ -361,9 +401,10 @@
       _logBuffer.push(line);
     }
 
-    if (CONFIG.logging.telegram.enabled) {
-      _tgBuffer.push(line);
-      _scheduleTgFlush();
+    // Collect into the per-round event accumulator for the end-of-round
+    // Telegram summary.  Immediate / system messages use sendTelegramImmediate.
+    if (CONFIG.logging.telegram.enabled && CONFIG.logging.telegram.summaryPerRound) {
+      _roundEvents.push({ ts: _timestamp(), feature, level, message });
     }
   }
 
@@ -528,8 +569,7 @@
     console.error(summary);
 
     if (CONFIG.logging.telegram.enabled) {
-      _tgBuffer.push(summary);
-      await _flushTelegram(true);
+      await sendTelegramImmediate(summary.slice(0, 4096));
     }
 
     if (CONFIG.logging.toFile) _downloadLog();
@@ -564,8 +604,335 @@
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // ─── Game-state helpers ───────────────────────────────────────────────────
+  // ─── Dialog / popup detection & dismissal ────────────────────────────────
   // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Returns true when any non-captcha game dialog or popup overlay is visible.
+   * Covers: React modal components, event popups, goblin-swarm overlays,
+   * season / reward dialogs and similar screen-blocking panels.
+   */
+  function isGameDialogVisible() {
+    return !!(
+      document.querySelector("[role='dialog']")                            ||
+      document.querySelector("[aria-modal='true']")                        ||
+      document.querySelector("[class*='modal']:not([class*='captcha'])")   ||
+      document.querySelector("[class*='dialog']:not([class*='captcha'])")  ||
+      document.querySelector("[class*='popup']:not([class*='captcha'])")   ||
+      document.querySelector("[class*='goblin']")                          ||
+      document.querySelector("[class*='swarm']")                           ||
+      document.querySelector("[class*='event-modal']")                     ||
+      document.querySelector("[class*='reward-modal']")                    ||
+      document.querySelector("[class*='notification-modal']")              ||
+      document.querySelector("[class*='overlay'][class*='panel']")
+    );
+  }
+
+  /**
+   * Returns true if a countdown timer element is visible anywhere in the page.
+   * Used to decide whether to wait before trying to dismiss a dialog.
+   */
+  function _dialogHasTimer() {
+    const timerEl = document.querySelector(
+      "[class*='timer'], [class*='countdown'], [class*='clock']"
+    );
+    if (timerEl) {
+      const t = timerEl.textContent || "";
+      if (/\d+:\d+/.test(t)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Dismiss-text candidates in priority order.
+   * The script scans all visible buttons and clicks the first match.
+   */
+  const _DISMISS_LABELS = [
+    "Let's go", "Collect", "Claim", "Continue", "Next",
+    "Accept", "Confirm", "OK", "Okay", "Got it", "Acknowledge",
+    "Dismiss", "Done", "Skip", "Close",
+  ];
+
+  /**
+   * Attempt to dismiss any visible game dialog or popup by clicking the first
+   * recognisable action button.  Repeats until the dialog disappears or
+   * CONFIG.dialog.maxDismissAttempts is reached.
+   *
+   * If a countdown timer is detected the script waits timerWaitMs first so
+   * the timer can expire naturally.
+   *
+   * Also handles close-button icons (×, ✕) and [aria-label="Close"] buttons.
+   */
+  async function _dismissDialogs() {
+    if (!CONFIG.dialog.handleDialogs) return;
+
+    let attempts = 0;
+    while (attempts < CONFIG.dialog.maxDismissAttempts && !stopped) {
+      if (!isGameDialogVisible() && !isCaptchaVisible()) break;
+
+      if (_dialogHasTimer()) {
+        log("SYSTEM", "info",
+          `Dialog has timer – waiting ${CONFIG.dialog.timerWaitMs / 1000} s…`);
+        await _sleepMs(CONFIG.dialog.timerWaitMs);
+      }
+
+      // Collect all clickable elements currently in the DOM.
+      const buttons = Array.from(document.querySelectorAll(
+        "button, [role='button'], [class*='btn'], a[class*='action']"
+      )).filter(function (el) {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0; // only visible elements
+      });
+
+      let clicked = false;
+
+      // 1. Look for a labelled dismiss button.
+      for (const label of _DISMISS_LABELS) {
+        const btn = buttons.find(function (el) {
+          const t = (el.textContent || el.value || el.getAttribute("aria-label") || "")
+            .trim().toLowerCase();
+          return t === label.toLowerCase() || t.startsWith(label.toLowerCase());
+        });
+        if (btn) {
+          log("DIALOG", "ok", `Dismissed popup – clicked "${btn.textContent.trim().slice(0, 40)}"`);
+          simulateClick(btn);
+          await _sleepMs(randInt(CONFIG.dialog.dismissDelayMs.min, CONFIG.dialog.dismissDelayMs.max));
+          clicked = true;
+          break;
+        }
+      }
+
+      // 2. Fall back to close-icon buttons (×, ✕, aria-label="Close").
+      if (!clicked) {
+        const closeBtn = document.querySelector(
+          "button[aria-label='Close'], button[aria-label='close'], " +
+          "[class*='close-btn'], [class*='modal-close'], [class*='dialog-close']"
+        );
+        if (closeBtn && closeBtn.getBoundingClientRect().width > 0) {
+          log("DIALOG", "ok", "Dismissed popup – clicked close/X button.");
+          simulateClick(closeBtn);
+          await _sleepMs(randInt(CONFIG.dialog.dismissDelayMs.min, CONFIG.dialog.dismissDelayMs.max));
+          clicked = true;
+        }
+      }
+
+      if (!clicked) {
+        // No known dismiss button found; the dialog may require user action.
+        log("SYSTEM", "warn", "Dialog visible but no dismiss button found – waiting…");
+        await _sleepMs(CONFIG.dialog.timerWaitMs);
+      }
+
+      attempts++;
+    }
+
+    if (attempts > 0 && isGameDialogVisible()) {
+      log("SYSTEM", "warn",
+        `Dialog still visible after ${attempts} attempt(s) – continuing anyway.`);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ─── Screenshot helpers ───────────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+
+  let _html2canvasReady = false;
+
+  /**
+   * Attempts to capture the current viewport as a JPEG data-URL.
+   * Loads html2canvas from CDN on first call; returns null on any error.
+   */
+  async function _captureScreenshot() {
+    try {
+      if (!window.html2canvas) {
+        if (_html2canvasReady === false) {
+          // Load html2canvas from CDN (≈ 340 kB minified).
+          await new Promise(function (resolve, reject) {
+            const s  = document.createElement("script");
+            s.src    = "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js";
+            s.onload  = function () { _html2canvasReady = true; resolve(); };
+            s.onerror = reject;
+            document.head.appendChild(s);
+          });
+        }
+      } else {
+        _html2canvasReady = true;
+      }
+
+      if (!window.html2canvas) return null;
+
+      const canvas = await window.html2canvas(document.body, {
+        useCORS:        true,
+        allowTaint:     true,
+        scale:          0.5,          // half resolution – keeps file size small
+        ignoreElements: function (el) { return el.tagName === "IFRAME"; },
+      });
+      return canvas.toDataURL("image/jpeg", 0.7);
+    } catch (err) {
+      console.warn("[SYSTEM] Screenshot failed:", err.message || err);
+      return null;
+    }
+  }
+
+  /**
+   * Send a data-URL image to Telegram as a photo with the given caption.
+   * Falls back to a plain text message if the photo upload fails.
+   * Caption is truncated at 1 024 chars (Telegram API limit).
+   */
+  async function _sendTelegramPhoto(dataUrl, caption) {
+    const tg = CONFIG.logging.telegram;
+    if (!tg.enabled || !tg.botToken || !tg.chatId) return;
+    try {
+      const blobResp = await fetch(dataUrl);
+      const blob     = await blobResp.blob();
+      const form     = new FormData();
+      form.append("chat_id",    tg.chatId);
+      form.append("photo",      blob, "farm-screenshot.jpg");
+      form.append("caption",    caption.slice(0, 1024));
+      form.append("parse_mode", "HTML");
+      const resp = await fetch(
+        `https://api.telegram.org/bot${tg.botToken}/sendPhoto`,
+        { method: "POST", body: form }
+      );
+      if (!resp.ok) {
+        const body = await resp.text().catch(function () { return "(unreadable)"; });
+        console.error("[SYSTEM] ❌ Telegram sendPhoto error:", resp.status, body);
+        // Fall back to text.
+        await sendTelegramImmediate(caption.slice(0, 4096));
+      }
+    } catch (err) {
+      console.error("[SYSTEM] ❌ Telegram sendPhoto failed:", err);
+      await sendTelegramImmediate(caption.slice(0, 4096));
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ─── Round summary (Telegram) ─────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+
+  const _FEATURE_EMOJI = { CROPS: "🌾", FLOWERS: "🌸", RESOURCES: "⛏️", DIALOG: "💬", SYSTEM: "⚙️" };
+
+  /**
+   * Format _roundEvents into a human-readable summary string grouped by
+   * feature category.  Consecutive duplicate messages are counted and
+   * collapsed into one line (e.g. "Harvested a plot ×5").
+   */
+  function _formatRoundSummary(roundNum) {
+    const byFeature = {};
+    for (const ev of _roundEvents) {
+      if (!byFeature[ev.feature]) byFeature[ev.feature] = [];
+      byFeature[ev.feature].push(ev);
+    }
+
+    const lines = [
+      `🌻 <b>Round #${roundNum}</b> · ${_timestamp()}`,
+      "──────────────────────────────",
+    ];
+
+    const SKIP_PATTERNS = [
+      "⏳", "Next check", "Autotest started", "Enabled features",
+      "Starting crops round", "Starting flowers round",
+      "Starting resources round", "Resources round complete",
+      "Round done", "Yield summary", "─", "Errors so far",
+    ];
+
+    for (const [feature, events] of Object.entries(byFeature)) {
+      // Filter out routine timing / bookkeeping noise.
+      const meaningful = events.filter(function (ev) {
+        return SKIP_PATTERNS.every(function (p) { return !ev.message.includes(p); });
+      });
+      if (meaningful.length === 0) continue;
+
+      lines.push(`${_FEATURE_EMOJI[feature] || "•"} <b>${feature}</b>`);
+
+      // Collapse runs of identical messages.
+      const collapsed = [];
+      for (const ev of meaningful) {
+        const prev = collapsed[collapsed.length - 1];
+        if (prev && prev.message === ev.message && prev.level === ev.level) {
+          prev.count++;
+        } else {
+          collapsed.push({ ...ev, count: 1 });
+        }
+      }
+
+      // Separate coordinate-detail lines (resource hits) from other events.
+      const coordLines = [];
+      for (const ev of collapsed) {
+        if (ev.feature === "RESOURCES" && ev.message.includes("clicks:")) {
+          coordLines.push(ev.message);
+          continue;
+        }
+        const icon   = LEVEL_ICON[ev.level] || "•";
+        const suffix = ev.count > 1 ? ` ×${ev.count}` : "";
+        // Strip the leading "[HH:MM:SS] [FEATURE] icon " prefix already in message
+        lines.push(`  ${icon} ${ev.message}${suffix}`);
+      }
+
+      // Summarise coordinate lines compactly (first 3 then ellipsis).
+      if (coordLines.length > 0) {
+        lines.push(`  ✅ ${coordLines.length} node(s) depleted`);
+        for (const cl of coordLines.slice(0, 3)) {
+          const coords = cl.replace(/.*clicks:\s*/, "");
+          lines.push(`    📍 ${coords}`);
+        }
+        if (coordLines.length > 3) {
+          lines.push(`    … +${coordLines.length - 3} more`);
+        }
+      }
+    }
+
+    lines.push("──────────────────────────────");
+    const errs = _roundEvents.filter(function (e) { return e.level === "error"; }).length;
+    const warns = _roundEvents.filter(function (e) { return e.level === "warn"; }).length;
+    lines.push(
+      `📊 ${errs > 0 ? `❌ ${errs} error(s)` : "✅ No errors"} · ` +
+      `${warns > 0 ? `⚠️ ${warns} warning(s)` : "no warnings"} · ` +
+      `total errors ${_totalErrors}/${CONFIG.errorThreshold}`
+    );
+
+    return lines.join("\n");
+  }
+
+  /**
+   * Build the round summary, optionally capture a screenshot, and send
+   * everything to Telegram as either a photo+caption or a text message.
+   * Clears _roundEvents afterwards.
+   */
+  async function _sendRoundSummaryToTelegram(roundNum) {
+    const tg = CONFIG.logging.telegram;
+    if (!tg.enabled || !tg.summaryPerRound || !tg.botToken || !tg.chatId) return;
+    if (_roundEvents.length === 0) return;
+
+    const text = _formatRoundSummary(roundNum);
+
+    if (tg.sendScreenshot) {
+      const dataUrl = await _captureScreenshot();
+      if (dataUrl) {
+        await _sendTelegramPhoto(dataUrl, text);
+        _roundEvents.length = 0;
+        return;
+      }
+    }
+
+    try {
+      const resp = await fetch(
+        `https://api.telegram.org/bot${tg.botToken}/sendMessage`,
+        {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body:    JSON.stringify({ chat_id: tg.chatId, text: text.slice(0, 4096), parse_mode: "HTML" }),
+        }
+      );
+      if (!resp.ok) {
+        const body = await resp.text().catch(function () { return "(unreadable)"; });
+        console.error("[SYSTEM] ❌ Telegram summary error:", resp.status, body);
+      }
+    } catch (err) {
+      console.error("[SYSTEM] ❌ Telegram summary failed:", err);
+    } finally {
+      _roundEvents.length = 0;
+    }
+  }
   /**
    * Attempts to read the exposed game-state object.
    * Returns null when unavailable (graceful degradation).
@@ -1055,10 +1422,6 @@
             if (CONFIG.flowers.notifyIfCantPlant) {
               const msg = "No flower seeds identified – cannot plant.";
               log("FLOWERS", "warn", msg);
-              if (CONFIG.logging.telegram.enabled) {
-                _tgBuffer.push(`⚠️ FLOWERS: ${msg}`);
-                _scheduleTgFlush();
-              }
             }
             continue;
           }
@@ -1074,10 +1437,6 @@
             if (CONFIG.flowers.notifyIfCantPlant) {
               const msg = `Not enough ${seed} to plant – cannot proceed.`;
               log("FLOWERS", "warn", msg);
-              if (CONFIG.logging.telegram.enabled) {
-                _tgBuffer.push(`⚠️ FLOWERS: ${msg}`);
-                _scheduleTgFlush();
-              }
             }
             continue;
           }
@@ -1375,6 +1734,16 @@
         for (let hit = 0; hit < def.hits; hit++) {
           if (stopped) break;
 
+          // Check for a dialog that appeared mid-harvest and dismiss it.
+          if (isGameDialogVisible()) {
+            log("RESOURCES", "info", `[${type}] Dialog during harvest – dismissing…`);
+            await _dismissDialogs();
+            if (isGameDialogVisible()) {
+              log("RESOURCES", "warn", `[${type}] Could not dismiss dialog – stopping this resource.`);
+              break;
+            }
+          }
+
           // Sleep BEFORE every hit using plain setTimeout (CSP-safe).
           // Interval is drawn from CONFIG.resources.hitDelayMs.
           const preDelay = randInt(CONFIG.resources.hitDelayMs.min, CONFIG.resources.hitDelayMs.max);
@@ -1406,8 +1775,6 @@
         count++;
         const coordStr = hitCoords.join(" → ");
         log("RESOURCES", "ok", `[${type}] Depleted #${i + 1} – clicks: ${coordStr}`);
-        // Send click coordinates to Telegram immediately (not batched).
-        sendTelegramImmediate(`✅ [${type}] #${i + 1}/${imgs.length} depleted\nClicks: ${coordStr}`);
       } catch (err) {
         recordError("RESOURCES", `[${type}] Hit failed: ${err.message || err}`);
       }
@@ -1491,8 +1858,12 @@
 
     log("SYSTEM", "ok", "Autotest stopped by user.");
 
-    if (CONFIG.logging.toFile)              _downloadLog();
-    if (CONFIG.logging.telegram.enabled)    await _flushTelegram(true);
+    if (CONFIG.logging.toFile) _downloadLog();
+
+    // Send whatever events have accumulated in the current (partial) round.
+    if (CONFIG.logging.telegram.enabled && _roundEvents.length > 0) {
+      await _sendRoundSummaryToTelegram(_currentRound);
+    }
 
     _cleanup();
     console.log("🛑 Autotest fully stopped.  Run the script again to restart.");
@@ -1530,6 +1901,8 @@
 
     while (!stopped) {
       round++;
+      _currentRound = round;
+      _roundEvents.length = 0; // reset accumulator for this round
 
       // ── Pre-check summary ────────────────────────────────────────────────
       logYieldSummary();
@@ -1545,6 +1918,10 @@
       }
       if (stopped) break;
 
+      // ── Dismiss any active dialogs / popups before farming ───────────────
+      await _dismissDialogs();
+      if (stopped) break;
+
       // ── Run enabled modules ──────────────────────────────────────────────
       if (!stopped && !paused && CONFIG.features.crops)     await runCropsRound();
       if (!stopped && !paused && CONFIG.features.flowers)   await runFlowersRound();
@@ -1553,6 +1930,9 @@
       // ── Error budget check ───────────────────────────────────────────────
       _checkErrorBudget();
       if (stopped) break;
+
+      // ── Send round summary to Telegram ───────────────────────────────────
+      await _sendRoundSummaryToTelegram(round);
 
       // ── Wait for next cycle ──────────────────────────────────────────────
       const waitMs  = randomCheckInterval();
