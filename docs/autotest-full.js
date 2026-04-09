@@ -685,6 +685,28 @@
     );
   }
 
+  /**
+   * Send an immediate Telegram alert (with screenshot) when a captcha is
+   * detected, pausing the bot.  Idempotent: only sends if Telegram is enabled.
+   */
+  async function _alertCaptcha(feature) {
+    const msg =
+      `🔐 <b>Captcha / bot-detection detected!</b>\n` +
+      `Feature: ${feature} · Round #${_currentRound} · ${_timestamp()}\n` +
+      "The autotest has paused this module. Solve the captcha manually, " +
+      "then send /start to resume.";
+    log(feature, "warn", "Captcha detected – sending Telegram alert and pausing.");
+    if (CONFIG.logging.telegram.enabled) {
+      paused = true;
+      const shot = await _captureScreenshot().catch(function () { return null; });
+      if (shot) {
+        await _sendTelegramPhoto(shot, msg);
+      } else {
+        await sendTelegramImmediate(msg);
+      }
+    }
+  }
+
   // ══════════════════════════════════════════════════════════════════════════
   // ─── Dialog / popup detection & dismissal ────────────────────────────────
   // ══════════════════════════════════════════════════════════════════════════
@@ -1271,18 +1293,42 @@
    * Scrape item names + quantities from whatever is currently visible in the
    * DOM (assumes the inventory panel is already open).
    *
-   * SFL renders each item as a container with an <img alt="Item Name"> and a
-   * nearby text node / <span> showing the numeric count.  We cast a wide net
-   * of selectors and pick up every visible item we can identify.
+   * We first try to locate the open modal/panel container so that we only
+   * search within it, avoiding game-world images (land, bumpkin, fader…) that
+   * pollute the result when the full document is scanned.
    *
    * Returns a { name: count } map (may be empty if nothing is found).
    */
   function _scrapeOpenInventoryPanel() {
     const result = {};
     try {
+      // ── Narrow the search to the open panel/modal container ──────────────
+      // Try to find the topmost visible dialog / panel that opened as a
+      // result of clicking the inventory button.
+      const panelRoot = (function () {
+        const candidates = Array.from(document.querySelectorAll(
+          "[class*='modal'], [class*='panel'], [class*='inventory'], " +
+          "[class*='chest'], [class*='bag'], [class*='backpack'], " +
+          "[role='dialog'], [role='complementary']"
+        )).filter(function (el) {
+          const r = el.getBoundingClientRect();
+          return r.width > 50 && r.height > 50;
+        });
+        // Prefer the element with the most item-like img[alt] children.
+        let best = null, bestCount = 0;
+        for (const el of candidates) {
+          const imgs = el.querySelectorAll("img[alt]");
+          if (imgs.length > bestCount) { bestCount = imgs.length; best = el; }
+        }
+        return best;
+      })();
+
+      // Determine search root: use the panel if we found one, otherwise fall
+      // back to the full document (worst-case, same as before).
+      const searchRoot = panelRoot || document;
+
       // Gather every element that could be an inventory slot/item.
-      // We intentionally use broad selectors so this works across SFL updates.
-      const candidates = Array.from(document.querySelectorAll(
+      const candidates = Array.from(searchRoot.querySelectorAll(
         "[class*='inventory'] [class*='item'], " +
         "[class*='inventory'] [class*='slot'], " +
         "[class*='inventory'] [class*='card'], " +
@@ -1292,7 +1338,7 @@
         "[class*='panel']     [class*='item'], " +
         "[class*='bag']       [class*='item'], " +
         "[class*='backpack']  [class*='item'], " +
-        // Fallback: any element with an img[alt] that has a sibling number span
+        // Fallback: any img[alt] inside the located panel root
         "img[alt]"
       ));
 
@@ -1419,13 +1465,36 @@
    * Safe to call when the game state is already readable – it will use that
    * fast path and skip the panel open/close entirely.
    */
+  // Known game-world / meta keys that are NOT real inventory items.
+  // If a "fast-path" game-state inventory contains only these keys, skip it.
+  const _KNOWN_NON_INVENTORY_KEYS = new Set([
+    "land", "item", "bumpkin", "fader", "crop", "flower", "FLOWER",
+    "fruit", "rock", "tree", "iron", "gold", "house", "player",
+    "crab", "stamp", "banner", "decoration",
+  ]);
+
+  function _inventoryLooksReal(inv) {
+    const keys = Object.keys(inv);
+    if (keys.length === 0) return false;
+    // At least one key must NOT be in the meta-keys set and must look like
+    // a real item name (starts with uppercase or contains a space, like
+    // "Axe", "Stone Pickaxe", "Sunflower Seed", "Coins", "Gems" …).
+    return keys.some(function (k) {
+      if (_KNOWN_NON_INVENTORY_KEYS.has(k)) return false;
+      // Real item names start with an uppercase letter
+      return /^[A-Z]/.test(k);
+    });
+  }
+
   async function _refreshInventoryCache() {
     // Fast path: game state is readable – no need to open the UI.
+    // We validate the result before accepting it so we don't cache
+    // game-world metadata (land, bumpkin, fader …) as inventory.
     try {
       const gs = getGameState();
       if (gs) {
         const inv = gs.state?.inventory || gs.inventory || {};
-        if (Object.keys(inv).length > 0) {
+        if (Object.keys(inv).length > 0 && _inventoryLooksReal(inv)) {
           const result = {};
           for (const [k, v] of Object.entries(inv)) {
             result[k] = typeof v === "object" && v !== null
@@ -1433,6 +1502,11 @@
               : (Number(v) || 0);
           }
           _inventoryCache = { data: result, ts: Date.now() };
+          console.info(
+            "[SYSTEM] 📦 Inventory (game-state fast-path) –",
+            Object.keys(result).length, "items:"
+          );
+          console.table(result);
           return;
         }
       }
@@ -1467,7 +1541,11 @@
 
       if (Object.keys(scraped).length > 0) {
         _inventoryCache = { data: scraped, ts: Date.now() };
-        console.info("[SYSTEM] _refreshInventoryCache: cached", Object.keys(scraped).length, "items –", Object.entries(scraped).map(function([k,v]){return k+":"+v;}).join(", "));
+        console.info(
+          "[SYSTEM] 📦 Inventory (basket scrape) –",
+          Object.keys(scraped).length, "items:"
+        );
+        console.table(scraped);
       } else {
         console.warn("[SYSTEM] _refreshInventoryCache: panel opened but no items scraped.");
       }
@@ -1700,7 +1778,7 @@
 
   async function runCropsRound() {
     if (isCaptchaVisible()) {
-      log("CROPS", "warn", "Captcha detected – skipping crops round.");
+      await _alertCaptcha("CROPS");
       return;
     }
 
@@ -1866,6 +1944,15 @@
     }
 
     log("CROPS", "info", `Round done – harvested: ${harvested}, planted: ${planted}, fertilised: ${fertilised}.`);
+
+    // Telegram summary after crops round.
+    if (CONFIG.logging.telegram.enabled && (harvested > 0 || planted > 0 || fertilised > 0)) {
+      await sendTelegramImmediate(
+        `🌾 <b>Crops round done</b>\n` +
+        `Harvested: ${harvested} · Planted: ${planted} · Fertilised: ${fertilised}\n` +
+        `Round #${_currentRound} · ${_timestamp()}`
+      );
+    }
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -1980,7 +2067,7 @@
 
   async function runFlowersRound() {
     if (isCaptchaVisible()) {
-      log("FLOWERS", "warn", "Captcha detected – skipping flowers round.");
+      await _alertCaptcha("FLOWERS");
       return;
     }
 
@@ -2161,7 +2248,7 @@
    */
   async function runFruitsRound() {
     if (isCaptchaVisible()) {
-      log("FRUITS", "warn", "Captcha detected – skipping fruits round.");
+      await _alertCaptcha("FRUITS");
       return;
     }
 
@@ -2223,6 +2310,14 @@
 
     log("FRUITS", "info",
       `Round done – harvested: ${harvested}, planted: ${planted}, fertilised: ${fertilised}.`);
+
+    if (CONFIG.logging.telegram.enabled && (harvested > 0 || planted > 0 || fertilised > 0)) {
+      await sendTelegramImmediate(
+        `🍓 <b>Fruits round done</b>\n` +
+        `Harvested: ${harvested} · Planted: ${planted} · Fertilised: ${fertilised}\n` +
+        `Round #${_currentRound} · ${_timestamp()}`
+      );
+    }
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -2278,7 +2373,7 @@
    */
   async function runPetRound() {
     if (isCaptchaVisible()) {
-      log("PET", "warn", "Captcha detected – skipping pet round.");
+      await _alertCaptcha("PET");
       return;
     }
 
@@ -2368,7 +2463,7 @@
    */
   async function runHoneyRound() {
     if (isCaptchaVisible()) {
-      log("HONEY", "warn", "Captcha detected – skipping honey round.");
+      await _alertCaptcha("HONEY");
       return;
     }
 
@@ -2490,7 +2585,7 @@
    */
   async function runAnimalsRound() {
     if (isCaptchaVisible()) {
-      log("ANIMALS", "warn", "Captcha detected – skipping animals round.");
+      await _alertCaptcha("ANIMALS");
       return;
     }
 
@@ -3091,7 +3186,7 @@
     for (let i = 0; i < imgs.length; i++) {
       if (stopped) break;
       if (isCaptchaVisible()) {
-        log("RESOURCES", "warn", `[${type}] Captcha detected – pausing.`);
+        await _alertCaptcha("RESOURCES");
         break;
       }
 
@@ -3173,7 +3268,7 @@
 
   async function runResourcesRound(round) {
     if (isCaptchaVisible()) {
-      log("RESOURCES", "warn", "Captcha detected – skipping resources round.");
+      await _alertCaptcha("RESOURCES");
       return;
     }
 
@@ -3197,7 +3292,16 @@
       if (stopped) return;
       if (!featureFlags[type]) continue;
       try {
-        await harvestResource(type, round);
+        const depleted = await harvestResource(type, round);
+        // ── Per-type Telegram summary ──────────────────────────────────────
+        if (CONFIG.logging.telegram.enabled && depleted > 0) {
+          const toolCfg = CONFIG.resources.tools[type];
+          const toolInfo = toolCfg ? ` (tool: ${toolCfg.tool})` : "";
+          await sendTelegramImmediate(
+            `⛏️ <b>[${type}]</b> Finished – depleted ${depleted} node(s)${toolInfo}.\n` +
+            `Round #${round} · ${_timestamp()}`
+          );
+        }
         if (!stopped) await randomDelay();
       } catch (err) {
         recordError("RESOURCES", `[${type}] Round error: ${err.message || err}`);
@@ -3423,6 +3527,14 @@
 
     log("SYSTEM", "ok", "Autotest stopped by user.");
 
+    // Immediately notify Telegram that the bot has stopped.
+    if (CONFIG.logging.telegram.enabled) {
+      await sendTelegramImmediate(
+        `🛑 <b>Autotest stopped</b> · ${_timestamp()}\n` +
+        `Completed rounds: ${_currentRound}`
+      ).catch(function () {});
+    }
+
     if (CONFIG.logging.toFile) _downloadLog();
 
     // Send whatever events have accumulated in the current (partial) round.
@@ -3500,6 +3612,13 @@
       if (stopped) break;
 
       // ── Run enabled modules ──────────────────────────────────────────────
+      // Resources (minerals/trees) run first so tools are confirmed available
+      // before crop/fruit planting logic runs.
+      if (!stopped && !paused) {
+        await _dismissDialogs();
+        await runResourcesRound(round);
+        await _humanMouseDrift();
+      }
       if (!stopped && !paused && CONFIG.features.crops) {
         await _dismissDialogs();
         await runCropsRound();
@@ -3528,10 +3647,6 @@
         await _dismissDialogs();
         await runAnimalsRound();
         await _humanMouseDrift();
-      }
-      if (!stopped && !paused) {
-        await _dismissDialogs();
-        await runResourcesRound(round);
       }
 
       // ── Memory pressure check after heavy round ──────────────────────────
