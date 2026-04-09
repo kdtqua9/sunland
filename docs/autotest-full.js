@@ -1291,10 +1291,20 @@
   function _walkFiberForGameState(node, maxDepth) {
     if (!node || maxDepth <= 0) return null;
     try {
-      // memoizedState is a linked list of hook states for function components.
+      // Strategy A – memoizedProps (class-component pattern, confirmed working
+      // in production Sunflower Land builds via basket-inspector.js approach).
+      const p = node.memoizedProps;
+      if (p?.state?.inventory) return p.state;
+      if (p?.inventory && typeof p.inventory === "object") return p;
+    } catch (_) {}
+
+    try {
+      // Strategy B – memoizedState hook chain (function-component / XState hook).
       // XState's useMachine hook stores { machine, state, service } or the
       // machine context on one of the hook nodes.
       let hook = node.memoizedState;
+      // Fast path: direct inventory on top-level memoizedState
+      if (hook?.inventory && typeof hook.inventory === "object") return hook;
       while (hook) {
         const val = hook.memoizedState;
         // XState service-like objects have a getSnapshot / state property
@@ -1339,7 +1349,10 @@
       // Discover the React internal key (e.g. "__reactFiber$abc123")
       if (!_fiberKeyPrefix) {
         _fiberKeyPrefix = Object.keys(root).find(function (k) {
-          return k.startsWith("__reactFiber$") || k.startsWith("_reactFiber");
+          return k.startsWith("__reactFiber$")          ||
+                 k.startsWith("_reactFiber")            ||
+                 k.startsWith("__reactContainer")       ||
+                 k.startsWith("__reactInternalInstance");
         }) || null;
       }
       if (!_fiberKeyPrefix) return null;
