@@ -1017,12 +1017,46 @@
   // ─── Round summary (Telegram) ─────────────────────────────────────────────
   // ══════════════════════════════════════════════════════════════════════════
 
-  const _FEATURE_EMOJI = { CROPS: "🌾", FLOWERS: "🌸", FRUITS: "🍎", RESOURCES: "⛏️", PET: "🐾", HONEY: "🍯", ANIMALS: "🐄", DIALOG: "💬", SYSTEM: "⚙️" };
+  const _FEATURE_EMOJI = { CROPS: "🌾", FLOWERS: "🌸", FRUITS: "🍓", RESOURCES: "⛏️", PET: "🐾", HONEY: "🍯", ANIMALS: "🐄", DIALOG: "💬", SYSTEM: "⚙️" };
+
+  /**
+   * Read Coins / Gems / FLOWER counts from the HUD balance bar.
+   * SFL renders balances as  <span class="balance-text">50</span>
+   * next to an <img alt="Coins"> (or "Gems" / "FLOWER").
+   * Returns { coins, gems, flower } (each 0 when not found).
+   */
+  function _readHudBalances() {
+    let coins = 0, gems = 0, flower = 0;
+    try {
+      const spans = Array.from(document.querySelectorAll("span.balance-text, [class*='balance-text']"));
+      for (const span of spans) {
+        // Look for an img sibling (before or after) with a recognisable alt.
+        const parent = span.parentElement;
+        if (!parent) continue;
+        const img = parent.querySelector("img[alt]");
+        if (!img) continue;
+        const alt = (img.getAttribute("alt") || "").trim().toLowerCase();
+        const val = parseFloat((span.textContent || "").replace(/,/g, "")) || 0;
+        if (alt === "coins")              coins  = val;
+        else if (alt === "gems")          gems   = val;
+        else if (alt === "flower" || alt === "flower ") flower = val;
+      }
+    } catch (_) {}
+    return { coins, gems, flower };
+  }
 
   /**
    * Format _roundEvents into a human-readable summary string grouped by
-   * feature category.  Consecutive duplicate messages are counted and
-   * collapsed into one line (e.g. "Harvested a plot ×5").
+   * feature category.
+   *
+   * Rules:
+   *  • No HTML tags (Telegram plain-text mode).  Bold-like emphasis is done
+   *    with Unicode separators and emoji icons only.
+   *  • Blank line between every group.
+   *  • RESOURCES group shows per-type "[stone]: X/Y depleted" lines.
+   *  • Consecutive duplicate messages collapsed; no-seed / no-tool spam
+   *    further collapsed into a single summary per seed/tool per group.
+   *  • Coordinate lines (clicks:…) are dropped entirely from the message.
    */
   function _formatRoundSummary(roundNum) {
     const byFeature = {};
@@ -1031,74 +1065,178 @@
       byFeature[ev.feature].push(ev);
     }
 
-    const lines = [
-      `🌻 <b>Round #${roundNum}</b> · ${_timestamp()}`,
-      "──────────────────────────────",
-    ];
+    const EMOJI = { CROPS: "🌾", FLOWERS: "🌸", FRUITS: "🍓", RESOURCES: "⛏️", PET: "🐾", HONEY: "🍯", ANIMALS: "🐄", DIALOG: "💬", SYSTEM: "⚙️" };
 
     const SKIP_PATTERNS = [
       "⏳", "Next check", "Autotest started", "Enabled features",
-      "Starting crops round", "Starting flowers round",
-      "Starting resources round", "Resources round complete",
-      "Round done", "Yield summary", "─", "Errors so far",
+      "Starting crops round", "Starting flowers round", "Starting fruits round",
+      "Starting resources round", "Resources round complete", "Starting resources round",
+      "Resources round complete", "Round done", "Yield summary", "─",
+      "Errors so far", "Starting animals", "Starting honey", "Starting pet",
     ];
 
+    // Patterns that indicate spam we want to collapse into a single summary.
+    // We match on these substrings and group by the "subject" (seed/tool name).
+    const SPAM_PATTERNS = [
+      { re: /not in basket.*buy from shop/i,    key: function (m) { return m.match(/^([^–]+)/)?.[1]?.trim() || "seed"; }, label: "not in basket → buy attempt" },
+      { re: /Attempting to buy ([^…]+)/i,       key: function (m) { const x = m.match(/buy ([^…\n]+)/i); return x?.[1]?.trim() || "item"; }, label: "buy attempt" },
+      { re: /No diamonds available/i,           key: function ()  { return "__diamonds__"; }, label: "no diamonds for restock" },
+      { re: /not available.*skipping/i,         key: function (m) { return m.match(/^([^–]+)/)?.[1]?.trim() || "item"; }, label: "skipped (not available)" },
+      { re: /not found in basket/i,             key: function (m) { const x = m.match(/"([^"]+)"/); return x?.[1] || "item"; }, label: "not found in basket" },
+      { re: /Dialog\(s\) visible but no dismiss/i, key: function () { return "__dialog__"; }, label: "dialog no dismiss button" },
+    ];
+
+    // Parse RESOURCES events to produce per-type stats.
+    function _buildResourceStats(events) {
+      const stats = {}; // type → { found, depleted, skipped_reason }
+      for (const ev of events) {
+        // "[stone] Found 6 available."
+        let m = ev.message.match(/\[(\w+)\]\s+Found\s+(\d+)\s+available/i);
+        if (m) {
+          const t = m[1];
+          if (!stats[t]) stats[t] = { found: 0, depleted: 0, skipReason: null };
+          stats[t].found = parseInt(m[2], 10);
+          continue;
+        }
+        // "[stone] Done – depleted 3/6."
+        m = ev.message.match(/\[(\w+)\]\s+Done.*depleted\s+(\d+)\/(\d+)/i);
+        if (m) {
+          const t = m[1];
+          if (!stats[t]) stats[t] = { found: parseInt(m[3], 10), depleted: 0, skipReason: null };
+          stats[t].depleted = parseInt(m[2], 10);
+          continue;
+        }
+        // "[stone] Skipping – no tool available."
+        m = ev.message.match(/\[(\w+)\]\s+Skipping.*no tool/i);
+        if (m) {
+          const t = m[1];
+          if (!stats[t]) stats[t] = { found: 0, depleted: 0, skipReason: null };
+          stats[t].skipReason = "no tool";
+          continue;
+        }
+        // "Cannot harvest: no <tool> – purchase … failed."
+        m = ev.message.match(/\[(\w+)\].*Cannot harvest.*no ([^–]+)/i);
+        if (m) {
+          const t = m[1];
+          if (!stats[t]) stats[t] = { found: 0, depleted: 0, skipReason: null };
+          stats[t].skipReason = `no ${m[2].trim()} (buy failed)`;
+          continue;
+        }
+      }
+      return stats;
+    }
+
+    const sections = [];
+
     for (const [feature, events] of Object.entries(byFeature)) {
-      // Filter out routine timing / bookkeeping noise.
       const meaningful = events.filter(function (ev) {
+        if (ev.feature === "RESOURCES" && ev.message.includes("clicks:")) return false;
         return SKIP_PATTERNS.every(function (p) { return !ev.message.includes(p); });
       });
       if (meaningful.length === 0) continue;
 
-      lines.push(`${_FEATURE_EMOJI[feature] || "•"} <b>${feature}</b>`);
+      const icon = EMOJI[feature] || "•";
+      const groupLines = [`${icon} ${feature}`];
 
-      // Collapse runs of identical messages.
-      const collapsed = [];
-      for (const ev of meaningful) {
-        const prev = collapsed[collapsed.length - 1];
-        if (prev && prev.message === ev.message && prev.level === ev.level) {
-          prev.count++;
-        } else {
-          collapsed.push({ ...ev, count: 1 });
+      if (feature === "RESOURCES") {
+        // Show per-type stats instead of raw log lines.
+        const stats = _buildResourceStats(events);
+        for (const [type, s] of Object.entries(stats)) {
+          const skipped = s.found - s.depleted;
+          let line = `  [${type}]: ${s.depleted}/${s.found} depleted`;
+          if (s.skipReason)        line += ` · 0 done (${s.skipReason})`;
+          else if (skipped > 0)    line += ` · ${skipped} skipped`;
+          groupLines.push(line);
+        }
+        if (Object.keys(stats).length === 0) {
+          groupLines.push("  (no resources found)");
+        }
+      } else {
+        // ── Collapse spam patterns first ─────────────────────────────────
+        // For each spam pattern, bucket matching messages by key.
+        const spamBuckets = {}; // "patternIndex::key" → count
+        const nonSpam = [];
+
+        outer:
+        for (const ev of meaningful) {
+          for (let pi = 0; pi < SPAM_PATTERNS.length; pi++) {
+            const sp = SPAM_PATTERNS[pi];
+            if (sp.re.test(ev.message)) {
+              const k = `${pi}::${sp.key(ev.message)}`;
+              spamBuckets[k] = (spamBuckets[k] || 0) + 1;
+              continue outer;
+            }
+          }
+          nonSpam.push(ev);
+        }
+
+        // Collapse runs of identical non-spam messages.
+        const collapsed = [];
+        for (const ev of nonSpam) {
+          const prev = collapsed[collapsed.length - 1];
+          if (prev && prev.message === ev.message && prev.level === ev.level) {
+            prev.count++;
+          } else {
+            collapsed.push({ ...ev, count: 1 });
+          }
+        }
+
+        for (const ev of collapsed) {
+          const ic     = LEVEL_ICON[ev.level] || "•";
+          const suffix = ev.count > 1 ? ` ×${ev.count}` : "";
+          groupLines.push(`  ${ic} ${ev.message}${suffix}`);
+        }
+
+        // Emit collapsed spam summary lines.
+        for (const [k, cnt] of Object.entries(spamBuckets)) {
+          const pi   = parseInt(k.split("::")[0], 10);
+          const subj = k.split("::").slice(1).join("::");
+          const sp   = SPAM_PATTERNS[pi];
+          const subjectLabel = subj === "__diamonds__" ? "" : subj === "__dialog__" ? "" : ` "${subj}"`;
+          groupLines.push(`  ⚠️ ${sp.label}${subjectLabel} ×${cnt}`);
         }
       }
 
-      // Separate coordinate-detail lines (resource hits) from other events.
-      const coordLines = [];
-      for (const ev of collapsed) {
-        if (ev.feature === "RESOURCES" && ev.message.includes("clicks:")) {
-          coordLines.push(ev.message);
-          continue;
-        }
-        const icon   = LEVEL_ICON[ev.level] || "•";
-        const suffix = ev.count > 1 ? ` ×${ev.count}` : "";
-        // Strip the leading "[HH:MM:SS] [FEATURE] icon " prefix already in message
-        lines.push(`  ${icon} ${ev.message}${suffix}`);
-      }
-
-      // Summarise coordinate lines compactly (first 3 then ellipsis).
-      if (coordLines.length > 0) {
-        lines.push(`  ✅ ${coordLines.length} node(s) depleted`);
-        for (const cl of coordLines.slice(0, 3)) {
-          const coords = cl.replace(/.*clicks:\s*/, "");
-          lines.push(`    📍 ${coords}`);
-        }
-        if (coordLines.length > 3) {
-          lines.push(`    … +${coordLines.length - 3} more`);
-        }
-      }
+      sections.push(groupLines.join("\n"));
     }
 
-    lines.push("──────────────────────────────");
-    const errs = _roundEvents.filter(function (e) { return e.level === "error"; }).length;
-    const warns = _roundEvents.filter(function (e) { return e.level === "warn"; }).length;
-    lines.push(
+    // ── Balance line (Coins / Gems / FLOWER) ─────────────────────────────
+    const bal = _readHudBalances();
+    const balParts = [];
+    if (bal.coins  > 0) balParts.push(`🪙 ${bal.coins.toLocaleString()} Coins`);
+    if (bal.gems   > 0) balParts.push(`💎 ${bal.gems}  Gems`);
+    if (bal.flower > 0) balParts.push(`🌸 ${bal.flower} Flower`);
+    const balLine = balParts.length > 0 ? balParts.join("  ·  ") : "";
+
+    // ── RAM line ──────────────────────────────────────────────────────────
+    let ramLine = "";
+    try {
+      const mem = window.performance && window.performance.memory;
+      if (mem) {
+        const mb  = (n) => (n / 1_048_576).toFixed(0);
+        const pct = ((mem.usedJSHeapSize / mem.jsHeapSizeLimit) * 100).toFixed(0);
+        ramLine = `🧠 RAM: ${mb(mem.usedJSHeapSize)}/${mb(mem.jsHeapSizeLimit)} MB (${pct}%)`;
+      }
+    } catch (_) {}
+
+    const errs  = _roundEvents.filter(function (e) { return e.level === "error"; }).length;
+    const warns = _roundEvents.filter(function (e) { return e.level === "warn";  }).length;
+    const statsLine =
       `📊 ${errs > 0 ? `❌ ${errs} error(s)` : "✅ No errors"} · ` +
       `${warns > 0 ? `⚠️ ${warns} warning(s)` : "no warnings"} · ` +
-      `total errors ${_totalErrors}/${CONFIG.errorThreshold}`
-    );
+      `total errors ${_totalErrors}/${CONFIG.errorThreshold}`;
 
-    return lines.join("\n");
+    const headerLine = `🌻 Round #${roundNum}  ·  ${_timestamp()}`;
+    const divider    = "──────────────────────────────";
+
+    const parts = [headerLine, divider];
+    if (sections.length > 0) parts.push(sections.join("\n\n"));
+    parts.push(divider);
+    if (balLine)  parts.push(balLine);
+    if (ramLine)  parts.push(ramLine);
+    parts.push(statsLine);
+
+    return parts.join("\n");
   }
 
   /**
@@ -1128,7 +1266,7 @@
         {
           method:  "POST",
           headers: { "Content-Type": "application/json" },
-          body:    JSON.stringify({ chat_id: tg.chatId, text: text.slice(0, 4096), parse_mode: "HTML" }),
+          body:    JSON.stringify({ chat_id: tg.chatId, text: text.slice(0, 4096) }),
         }
       );
       if (!resp.ok) {
@@ -1290,21 +1428,97 @@
   const _INVENTORY_CACHE_TTL_MS = 60_000;
 
   /**
-   * Scrape item names + quantities from whatever is currently visible in the
-   * DOM (assumes the inventory panel is already open).
+   * Scrape item names + quantities from the open inventory/basket panel.
    *
-   * We first try to locate the open modal/panel container so that we only
-   * search within it, avoiding game-world images (land, bumpkin, fader…) that
-   * pollute the result when the full document is scanned.
+   * Primary strategy (C): SFL renders each basket slot as an <img> whose src
+   * comes from "sunflower-land.com/game-assets/…" (or the same path on the
+   * CDN).  The quantity lives in the next sibling (or nearby) element whose
+   * class contains "z-" (e.g. "z-10"), typically a <div> or <span> with just
+   * a number as text.  The item name is derived from the last path segment of
+   * the img src.
+   *
+   * Fallback: the previous alt-text + numeric-text-node approach is retained
+   * as a backup when the primary strategy finds nothing.
    *
    * Returns a { name: count } map (may be empty if nothing is found).
    */
   function _scrapeOpenInventoryPanel() {
     const result = {};
     try {
-      // ── Narrow the search to the open panel/modal container ──────────────
-      // Try to find the topmost visible dialog / panel that opened as a
-      // result of clicking the inventory button.
+      // ── Strategy C: game-assets img src ──────────────────────────────────
+      const assetImgs = Array.from(document.querySelectorAll(
+        "img[src*='game-assets'], img[src*='sunflower-land.com']"
+      )).filter(function (img) {
+        const r = img.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+
+      for (const img of assetImgs) {
+        // Derive a human-readable item name from the URL path.
+        const src  = img.getAttribute("src") || "";
+        // e.g. ".../crops/sunflower/seed.png"  → "Sunflower Seed"
+        //      ".../tools/axe.png"             → "Axe"
+        //      ".../resources/wood.png"        → "Wood"
+        const pathParts = src.split("?")[0].split("#")[0].split("/");
+        const fileName  = (pathParts[pathParts.length - 1] || "").replace(/\.\w+$/, "");
+        const folder    = pathParts[pathParts.length - 2] || "";
+        const folder2   = pathParts[pathParts.length - 3] || "";
+
+        // Build item name: combine folder(s) + filename, capitalise each word.
+        const raw = (
+          fileName === "seed" ? `${folder} seed` :
+          fileName === "seedling" ? `${folder} seedling` :
+          fileName === "crop"  ? folder :
+          folder === folder2   ? fileName :
+          `${folder} ${fileName}`
+        ).replace(/[-_]/g, " ").trim();
+
+        if (!raw || raw.length < 2) continue;
+
+        const name = raw
+          .split(/\s+/)
+          .map(function (w) { return w.charAt(0).toUpperCase() + w.slice(1); })
+          .join(" ");
+
+        // Skip obvious decorative/UI images.
+        if (/^(Left|Right|Up|Down|Close|Back|Forward|Arrow|Icon|Button|Bg|Background|Land|Bumpkin|Fader|Item|Crab)/.test(name)) continue;
+
+        // ── Quantity: look for a sibling div/span with class "z-*" ─────────
+        let qty = 0;
+        const parent = img.parentElement;
+        if (parent) {
+          // Search siblings and children for a z-class element with a number.
+          const zCandidates = Array.from(parent.querySelectorAll("[class*='z-']"))
+            .concat(Array.from(parent.children));
+          for (const zEl of zCandidates) {
+            const txt = (zEl.textContent || "").trim();
+            if (/^\d[\d,]*(\.\d+)?$/.test(txt)) {
+              qty = parseFloat(txt.replace(/,/g, ""));
+              break;
+            }
+          }
+          // Also check parent's direct text nodes.
+          if (qty === 0) {
+            for (const node of Array.from(parent.childNodes)) {
+              if (node.nodeType !== Node.TEXT_NODE) continue;
+              const t = (node.textContent || "").trim();
+              if (/^\d[\d,]*(\.\d+)?$/.test(t)) { qty = parseFloat(t.replace(/,/g, "")); break; }
+            }
+          }
+        }
+        if (qty === 0) qty = 1;
+
+        if (!result[name] || qty > result[name]) {
+          result[name] = qty;
+        }
+      }
+
+      // If the primary strategy found meaningful results, return them.
+      if (Object.keys(result).length > 3) return result;
+    } catch (_) {}
+
+    // ── Fallback: locate best panel container and scrape alt-text ─────────
+    try {
       const panelRoot = (function () {
         const candidates = Array.from(document.querySelectorAll(
           "[class*='modal'], [class*='panel'], [class*='inventory'], " +
@@ -1314,7 +1528,6 @@
           const r = el.getBoundingClientRect();
           return r.width > 50 && r.height > 50;
         });
-        // Prefer the element with the most item-like img[alt] children.
         let best = null, bestCount = 0;
         for (const el of candidates) {
           const imgs = el.querySelectorAll("img[alt]");
@@ -1322,74 +1535,40 @@
         }
         return best;
       })();
-
-      // Determine search root: use the panel if we found one, otherwise fall
-      // back to the full document (worst-case, same as before).
       const searchRoot = panelRoot || document;
 
-      // Gather every element that could be an inventory slot/item.
       const candidates = Array.from(searchRoot.querySelectorAll(
-        "[class*='inventory'] [class*='item'], " +
-        "[class*='inventory'] [class*='slot'], " +
-        "[class*='inventory'] [class*='card'], " +
-        "[class*='chest']     [class*='item'], " +
-        "[class*='chest']     [class*='slot'], " +
-        "[class*='modal']     [class*='item'], " +
-        "[class*='panel']     [class*='item'], " +
-        "[class*='bag']       [class*='item'], " +
-        "[class*='backpack']  [class*='item'], " +
-        // Fallback: any img[alt] inside the located panel root
-        "img[alt]"
+        "[class*='inventory'] [class*='item'], [class*='inventory'] [class*='slot'], " +
+        "[class*='modal'] [class*='item'], [class*='panel'] [class*='item'], img[alt]"
       ));
 
       for (const el of candidates) {
-        // For bare <img> hits, use the img itself as the anchor element
         const anchor = el.tagName === "IMG" ? el.parentElement || el : el;
         const rect   = anchor.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) continue;
-
-        // Item name: prefer img alt, then aria-label / title on the container
         const img  = el.tagName === "IMG" ? el : el.querySelector("img[alt]");
         const name = (
           img?.getAttribute("alt") ||
           anchor.getAttribute("aria-label") ||
-          anchor.getAttribute("title") ||
-          ""
+          anchor.getAttribute("title") || ""
         ).trim();
         if (!name || name.length < 2) continue;
-        // Skip decorative / UI images (arrows, icons, etc.)
         if (/^(left|right|up|down|close|back|forward|arrow|icon|button|bg|background)$/i.test(name)) continue;
 
-        // Quantity: the first visible text node that is purely numeric,
-        // searching the anchor and its immediate children.
         let qty = 0;
         const textCandidates = [anchor, ...Array.from(anchor.querySelectorAll("span, p, div, strong, b"))];
         for (const tc of textCandidates) {
-          // Only look at direct text (childNodes), not deep descendant text
           for (const node of Array.from(tc.childNodes)) {
             if (node.nodeType !== Node.TEXT_NODE) continue;
             const txt = (node.textContent || "").trim();
-            if (/^\d[\d,]*(\.\d+)?$/.test(txt)) {
-              qty = parseFloat(txt.replace(/,/g, ""));
-              break;
-            }
+            if (/^\d[\d,]*(\.\d+)?$/.test(txt)) { qty = parseFloat(txt.replace(/,/g, "")); break; }
           }
           if (qty > 0) break;
-          // Also accept a span whose *only* text content is a number
           const txt = (tc.textContent || "").trim();
-          if (/^\d[\d,]*(\.\d+)?$/.test(txt)) {
-            qty = parseFloat(txt.replace(/,/g, ""));
-            break;
-          }
+          if (/^\d[\d,]*(\.\d+)?$/.test(txt)) { qty = parseFloat(txt.replace(/,/g, "")); break; }
         }
-
-        // If no explicit count found, assume 1 (item is present)
         if (qty === 0) qty = 1;
-
-        // Accumulate (same item may appear in multiple visible containers)
-        if (!result[name] || qty > result[name]) {
-          result[name] = qty;
-        }
+        if (!result[name] || qty > result[name]) result[name] = qty;
       }
     } catch (_) {}
     return result;
@@ -3292,16 +3471,7 @@
       if (stopped) return;
       if (!featureFlags[type]) continue;
       try {
-        const depleted = await harvestResource(type, round);
-        // ── Per-type Telegram summary ──────────────────────────────────────
-        if (CONFIG.logging.telegram.enabled && depleted > 0) {
-          const toolCfg = CONFIG.resources.tools[type];
-          const toolInfo = toolCfg ? ` (tool: ${toolCfg.tool})` : "";
-          await sendTelegramImmediate(
-            `⛏️ <b>[${type}]</b> Finished – depleted ${depleted} node(s)${toolInfo}.\n` +
-            `Round #${round} · ${_timestamp()}`
-          );
-        }
+        await harvestResource(type, round);
         if (!stopped) await randomDelay();
       } catch (err) {
         recordError("RESOURCES", `[${type}] Round error: ${err.message || err}`);
